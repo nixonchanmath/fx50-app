@@ -1,0 +1,2857 @@
+<!DOCTYPE html>
+<html lang="zh-HK">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="FX Calculator">
+<meta name="theme-color" content="#20242b">
+<link rel="apple-touch-icon" sizes="180x180" href="icons/apple-touch-icon.png?v=2">
+<link rel="icon" type="image/png" sizes="32x32" href="icons/favicon-32.png?v=2">
+<link rel="manifest" href="manifest.webmanifest">
+<title>fx-50FH II 程式簿</title>
+</head>
+<body>
+<div id="app"></div>
+<script>
+// One place for the build's name. It shows under the keypad and goes into the
+// feedback form, so a tester's report can be matched to the build they ran.
+// Bump MINOR when a mode lands (BASE / SD / REG / FMLA) or something as big
+// as swapping out the whole display font; PATCH for fixes.
+const VERSION = '0.11.0';
+const BUILD_DATE = '2026-10-13';
+// build.mjs replaces this one declaration when producing the 3650 build.
+const MODEL = '50FHII';
+
+// fx-50FH II emulator — 15-digit decimal arithmetic
+// Mimics the calculator's internal format: 15-digit mantissa, exponent -99..99.
+// Representation: value = s * m * 10^q   where m is a BigInt of exactly 15 digits (or 0n).
+// Display exponent = q + 14.
+
+const PREC = 15;
+const TEN = 10n;
+const pow10 = n => TEN ** BigInt(n);
+const ndig = m => (m === 0n ? 0 : m.toString().length);
+
+class CalcError extends Error {
+  constructor(kind) { super(kind); this.kind = kind; }
+}
+const mathError = () => { throw new CalcError('Math ERROR'); };
+
+class Dec {
+  constructor(s, m, q) { this.s = s; this.m = m; this.q = q; }
+  get exp() { return this.q + PREC - 1; }   // decimal exponent of leading digit
+  isZero() { return this.m === 0n; }
+  neg() { return this.isZero() ? this : new Dec(-this.s, this.m, this.q); }
+  abs() { return new Dec(1, this.m, this.q); }
+}
+
+const ZERO = new Dec(1, 0n, 0);
+
+// Build a normalised Dec from raw mantissa/exponent. Rounds half-up to 15 digits.
+function mk(s, m, q) {
+  if (m < 0n) { s = -s; m = -m; }
+  if (m === 0n) return ZERO;
+  const n = ndig(m);
+  if (n > PREC) {
+    const drop = n - PREC, div = pow10(drop);
+    const r = m % div;
+    m = m / div; q += drop;
+    if (r * 2n >= div) {
+      m += 1n;
+      if (ndig(m) > PREC) { m /= TEN; q += 1; }
+    }
+  } else if (n < PREC) {
+    const add = PREC - n;
+    m *= pow10(add); q -= add;
+  }
+  return new Dec(s, m, q);
+}
+
+function fromString(str) {
+  const t = String(str).trim().replace(/[−–]/g, '-');
+  const mm = /^([+-]?)(\d*)(?:\.(\d*))?(?:[eE]([+-]?\d+))?$/.exec(t);
+  if (!mm || (!mm[2] && !mm[3])) throw new CalcError('Syntax ERROR');
+  const s = mm[1] === '-' ? -1 : 1;
+  const ip = mm[2] || '', fp = mm[3] || '';
+  const digits = (ip + fp).replace(/^0+(?=\d)/, '') || '0';
+  const q = -fp.length + (mm[4] ? parseInt(mm[4], 10) : 0);
+  return mk(s, BigInt(digits), q);
+}
+
+const fromInt = n => mk(n < 0 ? -1 : 1, BigInt(Math.abs(n)), 0);
+
+// Convert a JS double in. 17 significant digits then round to 15 — this is what
+// makes sin(30) come out as exactly 0.5 rather than 0.49999999999999994.
+function fromNumber(x) {
+  if (!isFinite(x)) mathError();
+  if (x === 0) return ZERO;
+  return fromString(x.toExponential(16));
+}
+
+const toNumber = d => Number(`${d.s < 0 ? '-' : ''}${d.m}e${d.q}`);
+
+function add(a, b) {
+  if (a.isZero()) return b;
+  if (b.isZero()) return a;
+  const q = Math.min(a.q, b.q);
+  const da = a.q - q, db = b.q - q;
+  if (da > 40) return a;          // b is below the guard digits
+  if (db > 40) return b;
+  const m = a.m * pow10(da) * BigInt(a.s) + b.m * pow10(db) * BigInt(b.s);
+  return mk(1, m, q);
+}
+
+const sub = (a, b) => add(a, b.neg());
+const mul = (a, b) => (a.isZero() || b.isZero()) ? ZERO : mk(a.s * b.s, a.m * b.m, a.q + b.q);
+
+function div(a, b) {
+  if (b.isZero()) mathError();
+  if (a.isZero()) return ZERO;
+  const G = 25;                    // guard digits
+  return mk(a.s * b.s, (a.m * pow10(G)) / b.m, a.q - b.q - G);
+}
+
+function cmp(a, b) {
+  const d = sub(a, b);
+  return d.isZero() ? 0 : d.s;
+}
+const eq = (a, b) => cmp(a, b) === 0;
+
+function isInteger(d) {
+  if (d.isZero()) return true;
+  if (d.q >= 0) return true;
+  const div_ = pow10(-d.q);
+  return d.m % div_ === 0n;
+}
+
+// Round to `sig` significant digits (value preserved, still stored as 15 digits).
+function roundSig(d, sig) {
+  if (d.isZero() || sig >= PREC) return d;
+  const drop = PREC - sig, div_ = pow10(drop);
+  let m = d.m / div_;
+  if ((d.m % div_) * 2n >= div_) m += 1n;
+  return mk(d.s, m, d.q + drop);
+}
+
+// Round to `dp` decimal places.
+function roundDp(d, dp) {
+  if (d.isZero()) return d;
+  const k = d.q + dp;
+  if (k >= 0) return d;
+  const div_ = pow10(-k);
+  let m = d.m / div_;
+  if ((d.m % div_) * 2n >= div_) m += 1n;
+  return mk(d.s, m, -dp);
+}
+
+const OVERFLOW_EXP = 100;
+function checkRange(d) {
+  if (!d.isZero() && d.exp >= OVERFLOW_EXP) mathError();
+  return d;
+}
+
+// ---------------------------------------------------------------- formatting
+
+// digits(d, n) -> { sign, ds (n chars), exp }
+function digitsOf(d, n) {
+  const r = roundSig(d, n);
+  return { s: r.s, ds: r.m.toString().slice(0, n), exp: r.exp };
+}
+
+// The mantissa field is 10 digit characters wide and the leading "0" of a
+// number below 1 occupies one of them. Verified on the machine:
+//   1÷2π  -> 0.159154943   (not 0.1591549431)
+//   1÷2√2 -> 0.35355339    (10 digits "0.353553390", trailing zero stripped)
+// Digits past the tenth character are cut, not re-rounded.
+const FIELD = 10;
+function plain(sign, ds, exp, cap = false) {
+  let out;
+  if (exp >= 0) {
+    const ip = ds.length > exp + 1 ? ds.slice(0, exp + 1) : ds.padEnd(exp + 1, '0');
+    let fp = ds.length > exp + 1 ? ds.slice(exp + 1) : '';
+    fp = fp.replace(/0+$/, '');
+    out = fp ? `${ip}.${fp}` : ip;
+  } else {
+    let d = ds;
+    if (cap) d = d.slice(0, Math.max(0, FIELD + exp));   // leading 0 + zeros eat places
+    const fp = ('0'.repeat(-exp - 1) + d).replace(/0+$/, '');
+    out = `0.${fp || '0'}`;
+  }
+  return (sign < 0 ? '-' : '') + out;
+}
+
+/**
+ * Format a result the way the calculator's lower display line shows it.
+ * cfg: { disp: 'norm1'|'norm2'|'fix'|'sci', n }
+ * Returns { mant, exp } — exp null means plain notation.
+ */
+function format(d, cfg = { disp: 'norm1' }) {
+  const disp = cfg.disp || 'norm1';
+  const n = cfg.n ?? 0;
+
+  if (disp === 'sci') {
+    const sig = n === 0 ? 10 : n;
+    const g = digitsOf(d, sig);
+    if (d.isZero()) return { mant: sig > 1 ? `0.${'0'.repeat(sig - 1)}` : '0', exp: 0 };
+    const mant = (g.s < 0 ? '-' : '') + (sig > 1 ? `${g.ds[0]}.${g.ds.slice(1)}` : g.ds[0]);
+    return { mant, exp: g.exp };
+  }
+
+  if (disp === 'fix') {
+    const r = roundDp(d, n);
+    // Too big for the display: the machine falls back to plain Norm1 exponential
+    // (trailing zeros stripped), NOT to a Fix-padded mantissa. Confirmed on the machine.
+    if (r.exp >= 10) return format(r, { disp: 'norm1' });
+    const sign = r.s < 0 && !r.isZero() ? '-' : '';
+    if (r.isZero()) return { mant: n ? `0.${'0'.repeat(n)}` : '0', exp: null };
+    const sig = Math.max(1, r.exp + 1 + n);
+    const g = digitsOf(r, Math.min(sig, PREC));
+    let body = plain(1, g.ds, g.exp);
+    if (n > 0) {
+      const dot = body.indexOf('.');
+      if (dot < 0) body += '.' + '0'.repeat(n);
+      else body = body.padEnd(dot + 1 + n, '0');
+    } else if (body.includes('.')) body = body.split('.')[0];
+    return { mant: sign + body, exp: null };
+  }
+
+  // Norm1 / Norm2
+  if (d.isZero()) return { mant: '0', exp: null };
+  const g = digitsOf(d, 10);
+  const lo = disp === 'norm2' ? -10 : -3;      // norm1: |x|<10^-2 -> exp <= -3
+  if (g.exp <= lo || g.exp >= 10) {
+    const ds = g.ds.replace(/0+$/, '') || '0';
+    const mant = (g.s < 0 ? '-' : '') + (ds.length > 1 ? `${ds[0]}.${ds.slice(1)}` : ds[0]);
+    return { mant, exp: g.exp };
+  }
+  return { mant: plain(g.s, g.ds, g.exp, true), exp: null };
+}
+
+// Engineering notation: shift exponent to a multiple of 3. dir -1 = ENG, +1 = ENG<-
+function engShift(d, cur, dir) {
+  const step = dir < 0 ? 3 : -3;
+  return { d, engExp: cur + step };
+}
+
+function formatEng(d, engExp) {
+  if (d.isZero()) return { mant: '0', exp: engExp };
+  const scaled = mk(d.s, d.m, d.q - engExp);
+  const g = digitsOf(scaled, 10);
+  return { mant: plain(g.s, g.ds, g.exp), exp: engExp };
+}
+
+function toDisplayString(d, cfg) {
+  const f = format(d, cfg);
+  return f.exp === null ? f.mant : `${f.mant}×10^${f.exp}`;
+}
+
+// fx-50FH II scientific constants: CODATA 2010, SPEC §9.
+// qₑ names the elementary-charge key; bare e remains Euler’s number.
+const SCI_CONSTANTS = [
+  ['mp', '1.672621777e-27'], ['mn', '1.674927351e-27'], ['me', '9.10938291e-31'], ['mμ', '1.883531475e-28'],
+  ['a₀', '5.2917721092e-11'], ['h', '6.62606957e-34'], ['μN', '5.05078353e-27'], ['μB', '9.27400968e-24'],
+  ['ħ', '1.054571726e-34'], ['α', '7.2973525698e-3'], ['re', '2.8179403267e-15'], ['λc', '2.4263102389e-12'],
+  ['γp', '267522200.5'], ['λcp', '1.32140985623e-15'], ['λcn', '1.3195909068e-15'], ['R∞', '10973731.568539'],
+  ['u', '1.660538921e-27'], ['μp', '1.410606743e-26'], ['μe', '-9.2847643e-24'], ['μn', '-9.6623647e-27'],
+  ['μμ', '-4.49044807e-26'], ['F', '96485.3365'], ['e', '1.602176565e-19'], ['NA', '6.02214129e23'],
+  ['k', '1.3806488e-23'], ['Vm', '0.022710953'], ['R', '8.3144621'], ['C₀', '299792458'],
+  ['C₁', '3.74177153e-16'], ['C₂', '0.01438777'], ['σ', '5.670373e-8'], ['ε₀', '8.854187817e-12'],
+  ['μ₀', '12.566370614e-7'], ['φ₀', '2.067833758e-15'], ['g', '9.80665'], ['G₀', '7.7480917346e-5'],
+  ['Z₀', '376.730313461'], ['t', '273.15'], ['G', '6.67384e-11'], ['atm', '101325'],
+]
+const sciToken = symbol => symbol === "e" ? "qₑ" : symbol;
+const SCI_VALUES = Object.fromEntries(SCI_CONSTANTS.flatMap(([symbol,value],i) => [[sciToken(symbol),value],[`CONST(${i+1})`,value]]));
+const SCI_NAMES = Object.keys(SCI_VALUES).sort((a,b)=>b.length-a.length);
+
+// Numerical integration and differentiation for the fx-3650P II.
+// The 15-point Gauss–Kronrod pair estimates its own integration error.
+// The expression is parsed once by engine.mjs; sample() only changes X.
+const GK_X = [0.9914553711208126, 0.9491079123427585, 0.8648644233597691,
+  0.7415311855993945, 0.5860872354676911, 0.4058451513773972,
+  0.2077849550078985, 0];
+const GK_W = [0.022935322010529225, 0.06309209262997855, 0.10479001032225018,
+  0.14065325971552592, 0.1690047266392679, 0.19035057806478542,
+  0.2044329400752989, 0.20948214108472783];
+const G_W = [0, 0.1294849661688697, 0, 0.27970539148927664,
+  0, 0.3818300505051189, 0, 0.4179591836734694];
+
+function integrate(sample, a, b, tolerance = 1e-5) {
+  if (a === b) return 0;
+  const sign = b < a ? -1 : 1;
+  if (sign < 0) [a, b] = [b, a];
+  let result = 0, used = 0;
+  const stack = [[a, b]];
+  while (stack.length) {
+    const [lo, hi] = stack.pop();
+    const mid = (lo + hi) / 2, half = (hi - lo) / 2;
+    let kronrod = GK_W[7] * sample(mid);
+    let gauss = G_W[7] * sample(mid);
+    used++;
+    for (let j = 0; j < 7; j++) {
+      const pair = sample(mid - half * GK_X[j]) + sample(mid + half * GK_X[j]);
+      used += 2;
+      kronrod += GK_W[j] * pair;
+      gauss += G_W[j] * pair;
+    }
+    kronrod *= half; gauss *= half;
+    // Scale each interval's allowance by its share of the original domain.
+    const allowance = tolerance * (hi - lo) / (b - a) * Math.max(1, Math.abs(kronrod));
+    if (Math.abs(kronrod - gauss) <= allowance) result += kronrod;
+    else {
+      if (used >= 30000 || mid === lo || mid === hi) throw new Error('Time Out Error');
+      stack.push([mid, hi], [lo, mid]);
+    }
+  }
+  return sign * result;
+}
+
+function differentiate(sample, x, tolerance = 1e-10) {
+  const scale = Math.max(1, Math.abs(x));
+  let h = scale * 1e-3, previous = null;
+  for (let k = 0; k < 16; k++) {
+    const coarse = (sample(x + h) - sample(x - h)) / (2 * h);
+    const fine = (sample(x + h / 2) - sample(x - h / 2)) / h;
+    const estimate = (4 * fine - coarse) / 3;
+    if (previous !== null && Math.abs(estimate - previous) <= tolerance * Math.max(1, Math.abs(estimate)))
+      return estimate;
+    previous = estimate;
+    h /= 2;
+  }
+  throw new Error('Time Out Error');
+}
+
+
+// fx-50FH II emulator — expression engine (lexer + parser + evaluator)
+// Precedence follows the official 12-level table in SPEC.md §8.
+
+
+
+
+
+const err = k => { throw new CalcError(k); };
+const mathErr = () => err('Math ERROR');
+const synErr = () => err('Syntax ERROR');
+
+// ------------------------------------------------------------ complex layer
+// A value is a Dec (real) or a Cx (complex). Cx is only produced when the
+// imaginary part is non-zero, so real-only work never pays for complex code.
+class Cx {
+  constructor(re, im) { this.re = re; this.im = im; }
+}
+const isCx = v => v instanceof Cx;
+const RE = v => (isCx(v) ? v.re : v);
+const IM = v => (isCx(v) ? v.im : ZERO);
+const cx = (re, im) => (im.isZero() ? re : new Cx(re, im));
+
+const cadd = (a, b) => cx(add(RE(a), RE(b)), add(IM(a), IM(b)));
+const csub = (a, b) => cx(sub(RE(a), RE(b)), sub(IM(a), IM(b)));
+const cmul = (a, b) => cx(
+  sub(mul(RE(a), RE(b)), mul(IM(a), IM(b))),
+  add(mul(RE(a), IM(b)), mul(IM(a), RE(b))));
+function cdiv(a, b) {
+  const c = RE(b), d = IM(b);
+  const den = add(mul(c, c), mul(d, d));
+  if (den.isZero()) mathErr();
+  return cx(div(add(mul(RE(a), c), mul(IM(a), d)), den),
+            div(sub(mul(IM(a), c), mul(RE(a), d)), den));
+}
+const cabs = v => (isCx(v) ? fromNumber(Math.hypot(toNumber(v.re), toNumber(v.im))) : v.abs());
+const cconj = v => (isCx(v) ? new Cx(v.re, v.im.neg()) : v);
+function cpowInt(z, k) {
+  if (k < 0) return cdiv(ONE, cpowInt(z, -k));
+  let r = ONE;
+  for (let i = 0; i < k; i++) r = cmul(r, z);
+  return r;
+}
+
+// dispatchers used by the evaluator
+const vadd = (a, b) => (isCx(a) || isCx(b) ? cadd(a, b) : add(a, b));
+const vsub = (a, b) => (isCx(a) || isCx(b) ? csub(a, b) : sub(a, b));
+const vmul = (a, b) => (isCx(a) || isCx(b) ? cmul(a, b) : mul(a, b));
+const vdiv = (a, b) => (isCx(a) || isCx(b) ? cdiv(a, b) : div(a, b));
+const vcheck = v => { if (isCx(v)) { checkRange(v.re); checkRange(v.im); return v; } return checkRange(v); };
+
+// ------------------------------------------------------------------ lexer
+
+// Longest match first.
+const LIT = [
+  ...SCI_NAMES.filter(s => s !== 'σ').map(s => [s, 'CONST', s]),
+  ['d/dx(', 'FN', 'diff'], ['∫(', 'FN', 'integral'],
+  ['sinh⁻¹(', 'FN', 'asinh'], ['cosh⁻¹(', 'FN', 'acosh'], ['tanh⁻¹(', 'FN', 'atanh'],
+  ['sin⁻¹(', 'FN', 'asin'], ['cos⁻¹(', 'FN', 'acos'], ['tan⁻¹(', 'FN', 'atan'],
+  ['asinh(', 'FN', 'asinh'], ['acosh(', 'FN', 'acosh'], ['atanh(', 'FN', 'atanh'],
+  ['sinh(', 'FN', 'sinh'], ['cosh(', 'FN', 'cosh'], ['tanh(', 'FN', 'tanh'],
+  ['asin(', 'FN', 'asin'], ['acos(', 'FN', 'acos'], ['atan(', 'FN', 'atan'],
+  ['sin(', 'FN', 'sin'], ['cos(', 'FN', 'cos'], ['tan(', 'FN', 'tan'],
+  ['log(', 'FN', 'log'], ['ln(', 'FN', 'ln'],
+  ['e^(', 'FN', 'exp'], ['10^(', 'FN', 'pow10'],
+  ['³√(', 'FN', 'cbrt'], ['cbrt(', 'FN', 'cbrt'],
+  ['√(', 'FN', 'sqrt'], ['sqrt(', 'FN', 'sqrt'],
+  ['Abs(', 'FN', 'abs'], ['Rnd(', 'FN', 'rnd'],
+  ['Conjg(', 'FN', 'conjg'], ['arg(', 'FN', 'arg'],
+  ['▸a+bi', 'POST', 'torect'], ['▸r∠θ', 'POST', 'topolar'],
+  ['∠', 'OP', 'ang'],
+  ['Pol(', 'FN', 'pol'], ['Rec(', 'FN', 'rec'],
+  ['Ran#', 'RAN', null],
+  ['Ans', 'VAR', 'Ans'],
+  // SD single-variable statistics. Longest first so Σx² beats Σx, and minX /
+  // maxX beat the bare X variable. σx² is not a token — it is σx with the x²
+  // key after it, exactly as the machine makes you type it (SPEC §11b).
+  ['Σx²y','STAT','sumx2y'], ['Σx³','STAT','sumx3'], ['Σx⁴','STAT','sumx4'],
+  ['Σxy','STAT','sumxy'], ['Σy²','STAT','ysumsq'], ['Σy','STAT','ysum'],
+  ['ȳ','STAT','ymean'], ['σy','STAT','ysd'], ['sy','STAT','yssd'],
+  ['x̂','POST','predictX'], ['ŷ','POST','predictY'],
+  ['regA','STAT','regA'], ['regB','STAT','regB'], ['regR','STAT','regR'],
+  ['a','STAT','regA'], ['b','STAT','regB'], ['r','STAT','regR'],
+  ['Σx²', 'STAT', 'sumsq'], ['Σx', 'STAT', 'sum'],
+  ['x̄', 'STAT', 'mean'], ['σx', 'STAT', 'sd'], ['sx', 'STAT', 'ssd'],
+  ['σ', 'CONST', 'σ'],
+  ['minX', 'STAT', 'min'], ['maxX', 'STAT', 'max'],
+  ['nPr', 'OP', 'nPr'], ['nCr', 'OP', 'nCr'],
+  // AFTER nPr / nCr: this table is scanned in order, and a bare 'n' placed
+  // earlier would swallow the first letter of both.
+  ['n', 'STAT', 'count'],
+  ['ˣ√', 'OP', 'xroot'], ['x√', 'OP', 'xroot'],
+  ['⁻¹', 'POST', 'inv'], ['²', 'POST', 'sq'], ['³', 'POST', 'cube'],
+  ['π', 'CONST', 'pi'], ['pi', 'CONST', 'pi'],
+  ['>=', 'REL', 'ge'], ['<=', 'REL', 'le'], ['<>', 'REL', 'ne'],
+  ['≠', 'REL', 'ne'], ['≥', 'REL', 'ge'], ['≤', 'REL', 'le'],
+  ['=', 'REL', 'eq'], ['>', 'REL', 'gt'], ['<', 'REL', 'lt'],
+  ['×', 'OP', 'mul'], ['*', 'OP', 'mul'], ['÷', 'OP', 'div'], ['/', 'OP', 'div'],
+  ['+', 'OP', 'addop'], ['-', 'OP', 'subop'], ['−', 'OP', 'subop'],
+  ['^', 'OP', 'pow'],
+  ['(', 'LP', null], [')', 'RP', null], [',', 'COMMA', null],
+  ['!', 'POST', 'fact'], ['%', 'POST', 'pct'],
+  ['°', 'DMS', null], ["'", 'DMS', null], ['"', 'DMS', null],
+  ['⌐', 'FRAC', null], ['」', 'FRAC', null], ['_', 'FRAC', null],
+  ['→', 'ASSIGN', null],
+  ['ᵈ', 'POST', 'udeg'], ['ʳ', 'POST', 'urad'], ['ᵍ', 'POST', 'ugra'],
+  ['e', 'CONST', 'e'], ['i', 'CONST', 'i'],
+].sort((a,b) => b[0].length-a[0].length);
+const VARS = ['A', 'B', 'C', 'D', 'X', 'Y', 'M'];
+const NUMRE = /^(?:\d+\.?\d*|\.\d+)(?:[Eᴇ][+-]?\d+)?/;
+
+function lex(src) {
+  const out = [];
+  let i = 0;
+  while (i < src.length) {
+    const c = src[i];
+    if (c === ' ' || c === '\t') { i++; continue; }
+    const rest = src.slice(i);
+    const nm = NUMRE.exec(rest);
+    if (nm && /[\d.]/.test(c)) {
+      out.push({ type: 'NUM', text: nm[0].replace('ᴇ', 'E'), hasPoint: nm[0].includes('.'), pos: i });
+      i += nm[0].length;
+      continue;
+    }
+    // EXP with no mantissa in front of it means 1: ᴇ3 is 1000.
+    // (Nixon's published programs write ᴇ3 → X for 1000 → X, two bytes.)
+    // The key types ᴇ, U+1D07 — 'E' is only what the engine writes internally,
+    // so both spellings have to lex. His Prog04 opens with "ᴇ-4i→X".
+    if (c === 'E' || c === 'ᴇ') {
+      const em = /^[Eᴇ]([+-]?\d+)/.exec(rest);
+      if (em) {
+        out.push({ type: 'NUM', text: `1E${em[1]}`, hasPoint: false, pos: i });
+        i += em[0].length;
+        continue;
+      }
+    }
+    let hit = null;
+    for (const [lit, type, val] of LIT) {
+      if (rest.startsWith(lit)) { hit = { type, val, text: lit }; break; }
+    }
+    if (!hit && VARS.includes(c)) hit = { type: 'VAR', val: c, text: c };
+    if (!hit) { const e = new CalcError('Syntax ERROR'); e.pos = i; throw e; }
+    hit.pos = i;
+    out.push(hit);
+    i += hit.text.length;
+  }
+  return out;
+}
+
+// ----------------------------------------------------------------- parser
+
+const BP = {
+  assign: 15, or: 20, and: 30, rel: 40, addsub: 50, muldiv: 60,
+  ncr: 70, implicit: 80, prefix: 90, frac: 100, post: 110,
+};
+
+const STARTERS = new Set(['NUM', 'CONST', 'VAR', 'FN', 'LP', 'RAN']);
+
+// How many arguments each bracketed function may take. Everything not listed
+// takes exactly one, and must therefore NOT swallow a comma: in
+// "log(Abs(D,Abs(BD」A" the comma belongs to log(, and Abs( has to close first.
+// Nixon's published Prog03 is written that way, so getting this wrong makes a
+// published program quietly return the wrong number.
+const MAX_ARGS = { log: 2, pol: 2, rec: 2, integral: 4, diff: 3 };
+
+class Parser {
+  constructor(toks, len) { this.t = toks; this.i = 0; this.len = len; }
+  fail() {
+    const t = this.peek();
+    const e = new CalcError('Syntax ERROR');
+    e.pos = t ? t.pos : this.len;
+    throw e;
+  }
+  peek(k = 0) { return this.t[this.i + k]; }
+  next() { return this.t[this.i++]; }
+  eat(type) { if (this.peek() && this.peek().type === type) { this.i++; return true; } return false; }
+  // A missing closing paren is legal at the end of the expression, and also
+  // immediately before "→ variable": the machine closes every open bracket
+  // before it stores. So -B」(2A→X means -B」(2A)→X, and √(D→Y means √(D)→Y.
+  // Nixon's published programs rely on this everywhere.
+  closeParen() {
+    if (this.eat('RP')) return;
+    const t = this.peek();
+    // nothing left, "→ variable", or a comma belonging to an enclosing
+    // two-argument function — all of these close the bracket for you
+    if (!t || t.type === 'ASSIGN' || t.type === 'COMMA') return;
+    this.fail();
+  }
+
+  parse() {
+    const n = this.expr(0);
+    if (this.peek()) this.fail();
+    return n;
+  }
+
+  atom() {
+    const t = this.peek();
+    if (!t) this.fail();
+    if (t.type === 'OP' && t.val === 'subop') { this.next(); return { k: 'neg', x: this.expr(BP.prefix) }; }
+    if (t.type === 'OP' && t.val === 'addop') { this.next(); return this.expr(BP.prefix); }
+    this.next();
+    switch (t.type) {
+      case 'NUM': return { k: 'num', v: fromString(t.text.replace('E', 'e')), hasPoint: t.hasPoint };
+      case 'CONST': return { k: 'const', name: t.val };
+      case 'VAR': return { k: 'var', name: t.val };
+      case 'STAT': return { k: 'stat', name: t.val };
+      case 'RAN': return { k: 'ran' };
+      // Bracket contents stop short of "→": assignment is a statement-level
+      // operator, so it can never live inside a bracket (see closeParen).
+      case 'LP': { const e = this.expr(BP.assign + 1); this.closeParen(); return e; }
+      case 'FN': {
+        const max = MAX_ARGS[t.val] ?? 1;
+        const args = [this.expr(BP.assign + 1)];
+        while (args.length < max && this.eat('COMMA')) args.push(this.expr(BP.assign + 1));
+        this.closeParen();
+        return { k: 'fn', name: t.val, args };
+      }
+      default: return this.fail();
+    }
+  }
+
+  expr(minbp) {
+    let left = this.atom();
+    for (;;) {
+      const t = this.peek();
+      if (!t) break;
+
+      if (t.type === 'POST') {
+        if (BP.post < minbp) break;
+        this.next();
+        left = { k: 'post', op: t.val, x: left };
+        continue;
+      }
+      if (t.type === 'DMS') {
+        if (BP.post < minbp) break;
+        this.next();
+        const parts = [left];
+        while (parts.length < 3 && this.peek() && this.peek().type === 'NUM'
+               && this.peek(1) && this.peek(1).type === 'DMS') {
+          parts.push({ k: 'num', v: fromString(this.next().text.replace('E', 'e')) });
+          this.next();
+        }
+        left = { k: 'dms', parts };
+        continue;
+      }
+      if (t.type === 'FRAC') {
+        if (BP.frac < minbp) break;
+        const parts = [left];
+        while (parts.length < 3 && this.peek() && this.peek().type === 'FRAC') {
+          this.next();
+          parts.push(this.expr(BP.frac + 1));
+        }
+        left = { k: 'frac', parts };
+        continue;
+      }
+      if (t.type === 'OP') {
+        const o = t.val;
+        if (o === 'pow' || o === 'xroot') {
+          if (BP.post < minbp) break;
+          this.next();
+          left = { k: o, l: left, r: this.expr(BP.post) };     // right-assoc
+          continue;
+        }
+        if (o === 'nPr' || o === 'nCr' || o === 'ang') {
+          if (BP.ncr < minbp) break;
+          this.next();
+          left = { k: o, l: left, r: this.expr(BP.ncr + 1) };
+          continue;
+        }
+        if (o === 'mul' || o === 'div') {
+          if (BP.muldiv < minbp) break;
+          this.next();
+          left = { k: 'bin', op: o, l: left, r: this.expr(BP.muldiv + 1) };
+          continue;
+        }
+        if (o === 'addop' || o === 'subop') {
+          if (BP.addsub < minbp) break;
+          this.next();
+          left = { k: 'bin', op: o, l: left, r: this.expr(BP.addsub + 1) };
+          continue;
+        }
+      }
+      if (t.type === 'ASSIGN') {
+        if (BP.assign < minbp) break;
+        this.next();
+        const v = this.next();
+        if (!v || v.type !== 'VAR') this.fail();
+        left = { k: 'store', x: left, name: v.val };
+        continue;
+      }
+      if (t.type === 'REL') {
+        if (BP.rel < minbp) break;
+        this.next();
+        left = { k: 'rel', op: t.val, l: left, r: this.expr(BP.rel + 1) };
+        continue;
+      }
+      // implicit multiplication — binds tighter than × ÷ (official level 6)
+      if (STARTERS.has(t.type)) {
+        if (BP.implicit < minbp) break;
+        left = { k: 'bin', op: 'mul', l: left, r: this.expr(BP.implicit + 1), implicit: true };
+        continue;
+      }
+      break;
+    }
+    return left;
+  }
+}
+
+const parse = src => new Parser(lex(src), src.length).parse();
+
+// -------------------------------------------------------------- evaluator
+
+const PI = fromString('3.14159265358980');
+const E_ = fromString('2.71828182845904');
+
+const D180 = fromInt(180), D200 = fromInt(200), D100 = fromInt(100), D60 = fromInt(60);
+const D3600 = fromInt(3600), ONE = fromInt(1), TWO = fromInt(2);
+
+function toRad(d, unit) {
+  if (unit === 'rad') return d;
+  return div(mul(d, PI), unit === 'gra' ? D200 : D180);
+}
+function fromRad(d, unit) {
+  if (unit === 'rad') return d;
+  return div(mul(d, unit === 'gra' ? D200 : D180), PI);
+}
+
+const trigLimit = { deg: 9e9, rad: 157079632.7, gra: 1e10 };
+const PERIOD = { deg: 360, gra: 400 };
+
+/** sin/cos/tan with exact values at the quarter-turns, so sin(180) is really 0. */
+function trigOf(name, v, unit) {
+  const period = PERIOD[unit];
+  if (period) {
+    let r = v % period;
+    if (r < 0) r += period;
+    const q = period / 4;
+    if (r % q === 0) {
+      const k = Math.round(r / q) % 4;
+      const S_ = [0, 1, 0, -1][k], C_ = [1, 0, -1, 0][k];
+      if (name === 'sin') return fromInt(S_);
+      if (name === 'cos') return fromInt(C_);
+      if (C_ === 0) mathErr();                 // tan 90, tan 270
+      return fromInt(S_ === 0 ? 0 : S_ / C_);
+    }
+    return fromNumber(Math[name]((r / period) * 2 * Math.PI));
+  }
+  return fromNumber(Math[name](v));
+}
+
+/** radians (from JS) back into the current angle unit, exactly: acos(-1) is 180. */
+function degOf(rad, unit) {
+  if (unit === 'rad') return fromNumber(rad);
+  return fromNumber((rad / Math.PI) * (unit === 'gra' ? 200 : 180));
+}
+
+function bigFact(n) { let r = 1n; for (let i = 2n; i <= n; i++) r *= i; return r; }
+
+function intPow(base, k) {
+  // exact integer power via BigInt so that 2^10 is exactly 1024
+  const neg = k < 0; k = Math.abs(k);
+  if (k === 0) return ONE;
+  let r = mk(base.s ** (k % 2 === 0 ? 2 : 1) < 0 ? -1 : 1, base.m ** BigInt(k), base.q * k);
+  r = mk(base.s < 0 && k % 2 === 1 ? -1 : 1, base.m ** BigInt(k), base.q * k);
+  return neg ? div(ONE, r) : r;
+}
+
+class Ctx {
+  constructor(opts = {}) {
+    this.angle = opts.angle || 'deg';           // deg | rad | gra
+    this.disp = opts.disp || { disp: 'norm1' };  // norm1 | norm2 | fix | sci
+    this.frac = opts.frac || 'ab/c';             // ab/c | d/c
+    this.cplx = opts.cplx || 'a+bi';             // a+bi | r∠θ
+    this.mode = opts.mode || 'COMP';             // COMP | CMPLX | BASE | SD | REG | PRGM
+    this.model = opts.model || MODEL;
+    this.vars = { A: ZERO, B: ZERO, C: ZERO, D: ZERO, X: ZERO, Y: ZERO, M: ZERO, Ans: ZERO };
+    this.rng = opts.rng || Math.random;
+    // SD samples: one entry per DT press, each {v, f} = value and frequency.
+    // Leaving SD (or ClrStat) empties it — SPEC §11b.
+    this.stat = [];
+    this.freqOn = opts.freqOn !== false;
+    this.regType = 'LIN';
+    this.reset();
+  }
+  reset() { this.sawFrac = false; this.sawPoint = false; this.sawDms = false; this.forceCplx = null; }
+}
+
+function evalNode(n, ctx) {
+  switch (n.k) {
+    case 'num':
+      if (n.hasPoint) ctx.sawPoint = true;
+      return n.v;
+    case 'const':
+      if (Object.prototype.hasOwnProperty.call(SCI_VALUES, n.name)) return fromString(SCI_VALUES[n.name]);
+      if (n.name === 'pi') return PI;
+      if (n.name === 'e') return E_;
+      return new Cx(ZERO, ONE);                    // i
+    case 'var': return ctx.vars[n.name] ?? ZERO;
+    case 'stat': return statValue(n.name, ctx);
+    case 'ran': return fromString((Math.floor(ctx.rng() * 1000) / 1000).toFixed(3));
+    case 'neg': {
+      const v = evalNode(n.x, ctx);
+      return isCx(v) ? new Cx(v.re.neg(), v.im.neg()) : v.neg();
+    }
+
+    case 'bin': {
+      const a = evalNode(n.l, ctx), b = evalNode(n.r, ctx);
+      switch (n.op) {
+        case 'addop': return vcheck(vadd(a, b));
+        case 'subop': return vcheck(vsub(a, b));
+        case 'mul': return vcheck(vmul(a, b));
+        case 'div': return vcheck(vdiv(a, b));
+      }
+      break;
+    }
+
+    case 'ang': {                                   // r∠θ  -> complex
+      const r = evalNode(n.l, ctx), th = evalNode(n.r, ctx);
+      if (isCx(r) || isCx(th)) mathErr();
+      const rad = toNumber(toRad(th, ctx.angle));
+      return vcheck(cx(mul(r, fromNumber(Math.cos(rad))), mul(r, fromNumber(Math.sin(rad)))));
+    }
+
+    case 'rel': {
+      const a = evalNode(n.l, ctx), b = evalNode(n.r, ctx);
+      if (isCx(a) || isCx(b)) {
+        // Nixon's realCal confirmation: compare both components for = and ≠.
+        if (n.op === 'eq' || n.op === 'ne') {
+          const same = eq(RE(a), RE(b)) && eq(IM(a), IM(b));
+          return (n.op === 'eq' ? same : !same) ? ONE : ZERO;
+        }
+        mathErr();
+      }
+      const c = cmp(a, b);
+      const t = { eq: c === 0, ne: c !== 0, gt: c > 0, ge: c >= 0, lt: c < 0, le: c <= 0 }[n.op];
+      return t ? ONE : ZERO;      // relational ops return 1 / 0 (goes to Ans)
+    }
+
+    case 'frac': {
+      ctx.sawFrac = true;
+      const p = n.parts.map(x => evalNode(x, ctx));
+      // A complex part is never an integer, and isInteger() would crash on one.
+      // Nixon's Co-Geo program divides complex numbers with the fraction key all
+      // through ("Y」(B−C", "abs(C」2(M−Conjg(M"), so this path has to hold up.
+      if (p.some(x => isCx(x) || !isInteger(x))) ctx.sawPoint = true;
+      if (p.length === 2) return vcheck(vdiv(p[0], p[1]));
+      if (p.length === 3) {
+        // a b/c needs a sign to decide add-or-subtract, which a complex whole
+        // part does not have. The machine has no complex mixed fraction either.
+        if (p.some(isCx)) mathErr();
+        const f = div(p[1], p[2]);
+        return p[0].s < 0 ? sub(p[0], f) : add(p[0], f);
+      }
+      return p[0];
+    }
+
+    case 'dms': {
+      ctx.sawDms = true;
+      const p = n.parts.map(x => evalNode(x, ctx));
+      const sign = p[0].s < 0 ? -1 : 1;
+      let v = p[0].abs();
+      if (p[1]) v = add(v, div(p[1], D60));
+      if (p[2]) v = add(v, div(p[2], D3600));
+      return sign < 0 ? v.neg() : v;
+    }
+
+    case 'post': {
+      const x = evalNode(n.x, ctx);
+      switch (n.op) {
+        case 'sq': return vcheck(vmul(x, x));
+        case 'cube': return vcheck(vmul(vmul(x, x), x));
+        case 'inv':
+          if (isCx(x)) return vcheck(cdiv(ONE, x));
+          return x.isZero() ? mathErr() : div(ONE, x);
+        case 'torect': ctx.forceCplx = 'a+bi'; return x;
+        case 'topolar': ctx.forceCplx = 'r∠θ'; return x;
+      }
+      if (isCx(x)) mathErr();
+      switch (n.op) {
+        case 'predictX': { const c = linearRegression(ctx); if(c.b.isZero()) mathErr(); return div(sub(x,c.a),c.b); }
+        case 'predictY': { const c = linearRegression(ctx); return add(c.a,mul(c.b,x)); }
+        case 'pct': return div(x, D100);
+        case 'udeg': return fromRad(toRad(x, 'deg'), ctx.angle);
+        case 'urad': return fromRad(x, ctx.angle);
+        case 'ugra': return fromRad(toRad(x, 'gra'), ctx.angle);
+        case 'fact': {
+          if (!isInteger(x) || x.s < 0 || cmp(x, fromInt(69)) > 0) mathErr();
+          return mk(1, bigFact(BigInt(Math.round(toNumber(x)))), 0);
+        }
+      }
+      break;
+    }
+
+    case 'pow': {
+      const a = evalNode(n.l, ctx), b = evalNode(n.r, ctx);
+      if (isCx(a)) {
+        // Verified on the machine: a complex base accepts ^2 and ^3 only —
+        // ^1, ^0 and fractional powers all give Math ERROR.
+        if (isCx(b) || !isInteger(b)) mathErr();
+        const k = toNumber(b);
+        if (k !== 2 && k !== 3) mathErr();
+        return vcheck(cpowInt(a, k));
+      }
+      if (isCx(b)) mathErr();
+      return checkRange(power(a, b));
+    }
+    case 'xroot': {
+      const a = evalNode(n.l, ctx), b = evalNode(n.r, ctx);   // a-th root of b
+      if (isCx(a) || isCx(b)) mathErr();
+      if (a.isZero()) mathErr();
+      return checkRange(power(b, div(ONE, a)));
+    }
+
+    case 'nPr': case 'nCr': {
+      const a = evalNode(n.l, ctx), b = evalNode(n.r, ctx);
+      if (isCx(a) || isCx(b)) mathErr();
+      if (!isInteger(a) || !isInteger(b) || a.s < 0 || b.s < 0 || cmp(b, a) > 0) mathErr();
+      const N = BigInt(Math.round(toNumber(a))), R = BigInt(Math.round(toNumber(b)));
+      if (N > 100000n) mathErr();
+      const p = bigFact(N) / bigFact(N - R);
+      return checkRange(mk(1, n.k === 'nPr' ? p : p / bigFact(R), 0));
+    }
+
+    case 'store': {
+      const v = evalNode(n.x, ctx);
+      ctx.vars[n.name] = v;
+      return v;
+    }
+
+    case 'fn': return callFn(n, ctx);
+  }
+  return synErr();
+}
+
+function power(a, b) {
+  if (isInteger(b) && Math.abs(toNumber(b)) <= 64) return intPow(a, Math.round(toNumber(b)));
+  if (a.s < 0) mathErr();                       // non-integer power of a negative number
+  if (a.isZero()) return b.s > 0 ? ZERO : mathErr();
+  return fromNumber(Math.pow(toNumber(a), toNumber(b)));
+}
+
+// Check the expression tree before evaluating any argument, so rejected
+// Pol/Rec/nested calculus never changes X, Y, or other calculator state.
+function containsFn(node, names) {
+  if (!node || typeof node !== 'object') return false;
+  if (node.k === 'fn' && names.includes(node.name)) return true;
+  return Object.values(node).some(v => Array.isArray(v)
+    ? v.some(child => containsFn(child, names)) : containsFn(v, names));
+}
+
+function calculus(n, ctx) {
+  if (ctx.model !== '3650PII' || ctx.mode !== 'COMP') mathErr();
+  const integral = n.name === 'integral';
+  if (n.args.length < (integral ? 3 : 2)) synErr();
+  if (n.args.some(arg => containsFn(arg, ['integral', 'diff'])) ||
+      containsFn(n.args[0], ['pol', 'rec'])) mathErr();
+  const hasTrig = containsFn(n.args[0], ['sin', 'cos', 'tan', 'asin', 'acos', 'atan']);
+  if (hasTrig && ctx.angle !== 'rad') mathErr();
+  const params = n.args.slice(1).map(arg => evalNode(arg, ctx));
+  if (params.some(isCx)) mathErr();
+  const values = params.map(toNumber);
+  const tol = values[integral ? 2 : 1] ?? (integral ? 1e-5 : 1e-10);
+  if (!Number.isFinite(tol) || tol < 1e-14) mathErr();
+  const oldX = ctx.vars.X;
+  const sample = x => {
+    ctx.vars.X = fromNumber(x);
+    const v = evalNode(n.args[0], ctx);
+    if (isCx(v)) mathErr();
+    return toNumber(v);
+  };
+  try {
+    const v = integral
+      ? integrate(sample, values[0], values[1], tol)
+      : differentiate(sample, values[0], tol);
+    // Remove accumulated binary quadrature noise below the engine's 15-digit
+    // decimal precision; true-machine last-digit parity needs hardware data.
+    return checkRange(fromNumber(Number(v.toPrecision(14))));
+  } catch (e) {
+    if (e.message === 'Time Out Error') err('Time Out Error');
+    throw e;
+  } finally {
+    ctx.vars.X = oldX;
+  }
+}
+
+function callFn(n, ctx) {
+  if (n.name === 'integral' || n.name === 'diff') return calculus(n, ctx);
+  const A = n.args.map(x => evalNode(x, ctx));
+  const x = A[0];
+
+  // complex-capable functions
+  if (n.name === 'abs') return cabs(x);
+  if (n.name === 'conjg') return cconj(x);
+  // Rnd( takes a complex number too, rounding each half on its own (Nixon,
+  // 2026-09-16). His Prog04 lives on it: with X = ᴇ-4i, a polynomial in X packs
+  // its coefficients into one complex number, and Fix0 + Rnd( is what shakes
+  // them back out one at a time — (2X+1)³ reads back 1, 6, 12, 8.
+  if (n.name === 'rnd' && isCx(x)) return cx(applyRound(x.re, ctx), applyRound(x.im, ctx));
+  if (n.name === 'arg') {
+    if (!isCx(x)) return x.s < 0 && !x.isZero() ? fromRad(PI, ctx.angle) : ZERO;
+    return fromRad(fromNumber(Math.atan2(toNumber(x.im), toNumber(x.re))), ctx.angle);
+  }
+  // everything else rejects complex arguments, exactly like the machine
+  if (A.some(isCx)) mathErr();
+
+  const u = ctx.angle;
+  const num = toNumber(x);
+
+  switch (n.name) {
+    case 'sin': case 'cos': case 'tan': {
+      if (Math.abs(num) >= trigLimit[u]) mathErr();
+      return trigOf(n.name, num, u);
+    }
+    case 'asin': case 'acos':
+      if (Math.abs(num) > 1) mathErr();
+      return degOf(Math[n.name](num), u);
+    case 'atan':
+      return degOf(Math.atan(num), u);
+    case 'sinh': case 'cosh': case 'tanh':
+      return fromNumber(Math[n.name](num));
+    case 'asinh': return fromNumber(Math.asinh(num));
+    case 'acosh': if (num < 1) mathErr(); return fromNumber(Math.acosh(num));
+    case 'atanh': if (Math.abs(num) >= 1) mathErr(); return fromNumber(Math.atanh(num));
+    case 'log':
+      if (A.length === 2) {                       // log(base, x)
+        const bs = toNumber(A[0]), v = toNumber(A[1]);
+        if (bs <= 0 || bs === 1 || v <= 0) mathErr();
+        return fromNumber(Math.log(v) / Math.log(bs));
+      }
+      if (num <= 0) mathErr();
+      return fromNumber(Math.log10(num));
+    case 'ln': if (num <= 0) mathErr(); return fromNumber(Math.log(num));
+    case 'exp': if (num > 230.2585092) mathErr(); return checkRange(fromNumber(Math.exp(num)));
+    case 'pow10': if (num >= 100) mathErr(); return checkRange(fromNumber(Math.pow(10, num)));
+    case 'sqrt':
+      if (x.s < 0) {
+        // √ of a negative real is fine in CMPLX mode: √(-4) = 2i
+        if (ctx.mode !== 'CMPLX') mathErr();
+        return new Cx(ZERO, fromNumber(Math.sqrt(-num)));
+      }
+      return fromNumber(Math.sqrt(num));
+    case 'cbrt': return fromNumber(Math.cbrt(num));
+    case 'rnd': return applyRound(x, ctx);
+    case 'pol': {
+      if (A.length < 2) synErr();          // Pol( needs both coordinates
+      const [px, py] = A;
+      const r = fromNumber(Math.hypot(toNumber(px), toNumber(py)));
+      const th = fromRad(fromNumber(Math.atan2(toNumber(py), toNumber(px))), ctx.angle);
+      ctx.vars.X = r; ctx.vars.Y = th;
+      return r;
+    }
+    case 'rec': {
+      if (A.length < 2) synErr();          // Rec( needs r and θ
+      const [r, th] = A;
+      const rad = toNumber(toRad(th, ctx.angle));
+      const px = mul(r, fromNumber(Math.cos(rad)));
+      const py = mul(r, fromNumber(Math.sin(rad)));
+      ctx.vars.X = px; ctx.vars.Y = py;
+      return px;
+    }
+  }
+  return synErr();
+}
+
+// Rnd( — really round the value to the current display setting
+function applyRound(x, ctx) {
+  const c = ctx.disp;
+  if (c.disp === 'fix') return roundDp(x, c.n);
+  if (c.disp === 'sci') return roundSig(x, c.n === 0 ? 10 : c.n);
+  return roundSig(x, 10);
+}
+
+// ------------------------------------------------------- result formatting
+
+// Decimal -> fraction via continued fractions, respecting the 10-digit total rule.
+function toFraction(d, style = 'ab/c') {
+  if (d.isZero()) return null;
+  const v = Math.abs(toNumber(d));
+  let [h1, k1, h0, k0] = [1, 0, 0, 1];
+  let xx = v;
+  for (let i = 0; i < 32; i++) {
+    const a = Math.floor(xx);
+    [h1, h0] = [a * h1 + h0, h1];
+    [k1, k0] = [a * k1 + k0, k1];
+    if (k1 > 0 && Math.abs(v - h1 / k1) < 1e-11 * Math.max(1, v)) break;
+    const frac = xx - a;
+    if (frac < 1e-12) break;
+    xx = 1 / frac;
+  }
+  if (!k1 || !isFinite(h1) || h1 > 1e10) return null;
+  if (k1 === 1) return null;                       // whole number: not a fraction
+  const sign = d.s < 0 ? -1 : 1;
+  if (style === 'd/c') {
+    if (String(h1).length + String(k1).length + 1 > 10) return null;
+    return { sign, int: 0, num: h1, den: k1, mixed: false };
+  }
+  const int = Math.floor(h1 / k1), num = h1 % k1;
+  if (int === 0) {
+    if (String(h1).length + String(k1).length + 1 > 10) return null;
+    return { sign, int: 0, num: h1, den: k1, mixed: false };
+  }
+  if (String(int).length + String(num).length + String(k1).length + 2 > 10) return null;
+  return { sign, int, num, den: k1, mixed: true };
+}
+
+function toDms(d) {
+  const neg = d.s < 0;
+  let v = d.abs();
+  let deg = Math.floor(toNumber(v));
+  let rem = mul(sub(v, fromInt(deg)), D60);
+  let min = Math.floor(toNumber(rem));
+  let sec = mul(sub(rem, fromInt(min)), D60);
+  // round seconds to 2 dp and carry
+  let secN = Number(toNumber(roundDp(sec, 2)).toFixed(2));
+  if (secN >= 60) { secN -= 60; min += 1; }
+  if (min >= 60) { min -= 60; deg += 1; }
+  return { neg, deg, min, sec: secN };
+}
+
+const fmtPlain = (d, cfg) => { const g = format(d, cfg); return g.exp === null ? g.mant : `${g.mant}×10^${g.exp}`; };
+
+const fracText = (f) => {
+  const s = f.sign < 0 ? '-' : '';
+  return f.mixed ? `${s}${f.int}」${f.num}」${f.den}` : `${s}${f.num}」${f.den}`;
+};
+
+/** CMPLX mode shows an exact fraction instead of a decimal, with no a b/c press.
+ *  Verified from the LCD photographs in Nixon's published In-Built Function 2:
+ *  (3+4i)÷(3-5i) reads -11」34 / 27」34, and (3+4i)⁻¹ reads 3」25 / -4」25 —
+ *  so it applies to a terminating fraction (3/25 = 0.12) as much as a recurring
+ *  one, and to the real and imaginary parts alike.
+ *  REAL: r∠θ output is left alone, and it is unverified whether a plain
+ *  sin(30) in CMPLX mode reads 0.5 or 1」2. */
+const fmtCxPart = (d, ctx, noFrac) => {
+  if (!noFrac && ctx.disp.disp === 'norm1' && !ctx.sawPoint) {
+    const f = toFraction(d, ctx.frac);
+    if (f) return fracText(f);
+  }
+  return fmtPlain(d, ctx.disp);
+};
+
+/** `opts.noFrac` turns off the automatic fraction display for complex results.
+ *  A ◢ inside a program uses it: Nixon's 2026-08-09 recording shows `X-C→A`
+ *  reading `-0.75`, only becoming `-3」4` once a b/c is pressed. The automatic
+ *  form in SPEC §8c is a manual-calculation behaviour, not a program one. */
+// ---------------------------------------------------- SD statistics (§11b)
+// ctx.stat holds one entry per DT press: {v, f} — the value and how many of it.
+// The count "n" is the total frequency, NOT the number of entries; the machine
+// shows the entry count only while you are typing data in ("Line=").
+// REG LIN: paired samples {v:x, y, f}; use centred decimal sums to avoid
+// cancellation when x has a large offset. Other regression types are not enabled.
+function pairedRows(ctx) {
+  if(ctx.mode !== 'REG' || ctx.regType !== 'LIN') mathErr();
+  const rows=ctx.stat || []; if(rows.some(r=>!r.y || isCx(r.v) || isCx(r.y))) mathErr();
+  return rows;
+}
+function linearRegression(ctx) {
+  const rows=pairedRows(ctx); const n=rows.reduce((s,r)=>s+r.f,0); if(n<2) mathErr();
+  const nd=fromInt(n);
+  const mean = key => div(rows.reduce((s,r)=>add(s,mul(r[key],fromInt(r.f))),ZERO),nd);
+  const mx=mean('v'),my=mean('y'); let xx=ZERO,xy=ZERO,yy=ZERO;
+  for(const r of rows) { const x=sub(r.v,mx),y=sub(r.y,my),f=fromInt(r.f);
+    xx=add(xx,mul(mul(x,x),f)); xy=add(xy,mul(mul(x,y),f)); yy=add(yy,mul(mul(y,y),f)); }
+  if(xx.isZero()) mathErr();
+  const b=div(xy,xx),a=sub(my,mul(b,mx));
+  return {a,b,xx,xy,yy};
+}
+function addRegressionData(ctx, source) {
+  pairedRows(ctx); const text=String(source||'').trim(); let row;
+  if(!text) { const last=ctx.stat[ctx.stat.length-1]; if(!last) synErr(); row={...last}; }
+  else {
+    let depth=0,comma=-1,semi=-1;
+    for(let i=0;i<text.length;i++) { const c=text[i]; if(c==='(') depth++; else if(c===')') depth--;
+      else if(depth===0 && c===',') { if(comma!==-1) synErr(); comma=i; }
+      else if(depth===0 && c===';') { if(semi!==-1) synErr(); semi=i; } }
+    if(comma<1 || semi!==-1 && semi<comma || depth!==0) synErr();
+    const x=evaluate(text.slice(0,comma),ctx),y=evaluate(text.slice(comma+1,semi===-1?text.length:semi),ctx);
+    if(isCx(x)||isCx(y)) mathErr();
+    let f=1;
+    if(semi!==-1) { const value=evaluate(text.slice(semi+1),ctx); if(isCx(value)) mathErr(); f=toNumber(value);
+      if(!ctx.freqOn || !Number.isSafeInteger(f) || f<1) synErr(); }
+    row={v:x,y,f};
+  }
+  if(ctx.stat.length >= (ctx.freqOn ? 26 : 40)) err('Data Full');
+  ctx.stat.push(row); ctx.vars.Ans=row.v; return row.v;
+}
+function statValue(name, ctx) {
+  if(['regA','regB','regR'].includes(name)) {
+    const c=linearRegression(ctx); if(name==='regA') return c.a; if(name==='regB') return c.b;
+    if(c.yy.isZero()) mathErr();
+    const r=toNumber(c.xy)/Math.sqrt(toNumber(c.xx))/Math.sqrt(toNumber(c.yy));
+    return fromNumber(Math.max(-1,Math.min(1,r)));
+  }
+  if(['ysum','ysumsq','ymean','ysd','yssd'].includes(name)) {
+    const rows=pairedRows(ctx); return statValue({ysum:'sum',ysumsq:'sumsq',ymean:'mean',ysd:'sd',yssd:'ssd'}[name], {...ctx,stat:rows.map(r=>({v:r.y,f:r.f}))});
+  }
+  if(['sumxy','sumx2y','sumx3','sumx4'].includes(name)) {
+    return pairedRows(ctx).reduce((sum,r)=>{ const x=r.v; let v=mul(x,r.y);
+      if(name==='sumx2y') v=mul(x,v); if(name==='sumx3') v=mul(mul(x,x),x); if(name==='sumx4') v=mul(mul(x,x),mul(x,x));
+      return add(sum,mul(v,fromInt(r.f))); },ZERO);
+  }
+  const rows = ctx.stat || [];
+  let n = 0, sum = ZERO, sumsq = ZERO, lo = null, hi = null;
+  for (const { v, f } of rows) {
+    const fd = fromInt(f);
+    n += f;
+    sum = add(sum, mul(v, fd));
+    sumsq = add(sumsq, mul(mul(v, v), fd));
+    if (lo === null || cmp(v, lo) < 0) lo = v;
+    if (hi === null || cmp(v, hi) > 0) hi = v;
+  }
+  if (name === 'count') return fromInt(n);
+  if (name === 'sum') return sum;
+  if (name === 'sumsq') return sumsq;
+  // Everything below needs at least one sample, the same as the machine.
+  if (!n) mathErr();
+  if (name === 'min') return lo;
+  if (name === 'max') return hi;
+  const nd = fromInt(n);
+  const mean = div(sum, nd);
+  if (name === 'mean') return mean;
+  if (name === 'sd' || name === 'ssd') {
+    // σx is the population figure (÷n); sx is the sample one (÷n−1), which is
+    // slot 3 of S-VAR page 1 — Nixon confirmed it 2026-09-12.
+    const ss = sub(sumsq, mul(nd, mul(mean, mean)));   // Σ(x−x̄)²
+    if (name === 'ssd' && n < 2) mathErr();
+    const varce = div(ss, name === 'sd' ? nd : fromInt(n - 1));
+    if (varce.s < 0) return ZERO;                  // only ever rounding noise
+    return fromNumber(Math.sqrt(toNumber(varce)));
+  }
+  return mathErr();
+}
+
+function fmtResult(value, ctx, opts) {
+  const noFrac = !!(opts && opts.noFrac);
+  if (isCx(value) || ctx.forceCplx) {
+    const style = ctx.forceCplx || ctx.cplx;
+    if (style === 'r∠θ') {
+      const r = cabs(value);
+      const th = isCx(value)
+        ? fromRad(fromNumber(Math.atan2(toNumber(value.im), toNumber(value.re))), ctx.angle)
+        : (RE(value).s < 0 && !RE(value).isZero() ? fromRad(PI, ctx.angle) : ZERO);
+      return { type: 'cx', value, text: fmtPlain(r, ctx.disp), text2: fmtPlain(th, ctx.disp), polar: true };
+    }
+    return {
+      type: 'cx', value,
+      text: fmtCxPart(RE(value), ctx, noFrac),
+      text2: fmtCxPart(IM(value), ctx, noFrac),
+      polar: false,
+      // √(−4) shows "2" with the i mark straight away, not "0" first
+      imFirst: RE(value).isZero() && !IM(value).isZero(),
+    };
+  }
+  if (ctx.sawDms) {
+    const t = toDms(value);
+    return { type: 'dms', text: `${t.neg ? '-' : ''}${t.deg}°${t.min}°${t.sec}`, value };
+  }
+  if (ctx.sawFrac && !ctx.sawPoint && ctx.disp.disp === 'norm1') {
+    const f = toFraction(value, ctx.frac);
+    if (f) return { type: 'frac', text: fracText(f), value, frac: f };
+  }
+  const g = format(value, ctx.disp);
+  return { type: 'num', text: g.exp === null ? g.mant : `${g.mant}×10^${g.exp}`, value, fmt: g };
+}
+
+/** Evaluate an expression WITHOUT touching Ans (used by program control statements). */
+function evaluate(src, ctx = new Ctx()) {
+  ctx.reset();
+  return vcheck(evalNode(parse(src), ctx));
+}
+
+/** Evaluate one expression string. Returns { value, text, type } or throws CalcError. */
+function calc(src, ctx = new Ctx()) {
+  const v = evaluate(src, ctx);
+  ctx.vars.Ans = v;
+  return fmtResult(v, ctx);
+}
+
+
+
+
+
+// Shared memory arithmetic, including complex operands confirmed on hardware.
+
+
+// engine.mjs exports
+const vcmp = cmp;
+const valueIsComplex = isCx;
+const addValue = vadd;
+const subtractValue = vsub;
+
+
+// fx-50FH II emulator — PRGM mode: text -> instruction list -> stepping interpreter.
+// Command set and semantics follow SPEC.md §10 (fx-72F manual, PRGM chapter).
+
+
+
+
+// "{expr}M+" / "{expr}M−" adds to (subtracts from) independent memory — SPEC §10.
+// On the machine M+ is a single key, so a trailing M+ is never ambiguous.
+const MEM_RE = /^(.+?)M\s*([+\-−])$/;
+
+/** Evaluate one program expression, honouring a trailing M+ / M−.
+ *  The value of the expression is the operand, so this works as a statement
+ *  ("1M+") and equally inside a condition: Nixon's I-Prog01 opens its loop with
+ *  "While 1M−", which means "loop for ever, counting M down by one each time". */
+function calcStmt(src, ctx) {
+  const m = MEM_RE.exec(src);
+  if (!m) return calc(src, ctx);
+  if(ctx.mode==='REG' && m[2]==='+') return {value:addRegressionData(ctx,m[1])};
+  const r = calc(m[1], ctx);
+  ctx.vars.M = m[2] === '+' ? addValue(ctx.vars.M, r.value) : subtractValue(ctx.vars.M, r.value);
+  return r;
+}
+
+/** Syntax error that knows where it happened, so the editor can point at it. */
+const pSynErr = (pos) => {
+  const e = new CalcError('Syntax ERROR');
+  if (pos != null) e.pos = pos;
+  throw e;
+};
+
+// Words the user types in the editor. Longest first so IfEnd beats If.
+const KW = ['IfEnd', 'If', 'Then', 'Else', 'WhileEnd', 'While', 'For', 'To', 'Step', 'Next',
+  'Break', 'Goto', 'Lbl', 'ClrMemory', 'ClrStat', 'FreqOn', 'FreqOff',
+  'Deg', 'Rad', 'Gra', 'Fix', 'Sci', 'Norm', 'Dec', 'Hex', 'Bin', 'Oct', 'DT'];
+
+// The machine has one key per token, so there is no such thing as a wrong case.
+// In the editor we accept any case and rewrite it to the canonical form as you type.
+// Longest first: IfEnd before If, sinh( before sin(.
+const CANON = [
+  'sinh⁻¹(', 'cosh⁻¹(', 'tanh⁻¹(', 'sin⁻¹(', 'cos⁻¹(', 'tan⁻¹(',
+  'sinh(', 'cosh(', 'tanh(', 'sin(', 'cos(', 'tan(', 'log(', 'ln(',
+  'Conjg(', 'Abs(', 'Rnd(', 'Pol(', 'Rec(', 'arg(', 'd/dx(', '∫(',
+  'Ran#', 'Ans', 'nPr', 'nCr',
+  'x̄', 'sx', 'minX', 'maxX',
+  'ClrMemory', 'ClrStat', 'FreqOn', 'FreqOff',
+  'IfEnd', 'If', 'Then', 'Else', 'WhileEnd', 'While',
+  'For', 'To', 'Step', 'Next', 'Break', 'Goto', 'Lbl',
+  'Deg', 'Rad', 'Gra', 'Fix', 'Sci', 'Norm', 'Dec', 'Hex', 'Bin', 'Oct', 'DT',
+];
+const reEsc = s => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+const CANON_RE = CANON.map(w => [
+  new RegExp(reEsc(w) + (/[A-Za-z]$/.test(w) ? '(?![A-Za-z])' : ''), 'gi'),
+  w,
+]);
+
+// ⚠️ NO REGEX LOOKBEHIND ANYWHERE IN THIS PROJECT. Safari only learned
+// lookbehind assertions in 16.4, and one in a regex LITERAL is a parse
+// error — the whole bundle fails to parse, so the page is blank with nothing
+// on screen and no error the user can see. Older iPads are capped below 16.4,
+// and this app is meant to run on an iPad in class. build.mjs refuses to build
+// if one reappears. `replaceUnlessAfter` does the same job in plain code.
+const LETTER = /[A-Za-z]/;
+
+/** s.replace(re, repl) but skipping any match whose preceding character
+ *  matches `guard` — i.e. what a negative lookbehind on `guard` would have
+ *  done, without using one. `re` must be
+ *  global. A skipped match resumes scanning one character later, and an
+ *  accepted one resumes right after itself, so overlapping keywords still
+ *  match: "sin(sin(" converts both, exactly as the lookbehind version did. */
+function replaceUnlessAfter(s, re, repl, guard = LETTER) {
+  let out = '', last = 0, m;
+  re.lastIndex = 0;
+  while ((m = re.exec(s)) !== null) {
+    if (m.index > 0 && guard.test(s[m.index - 1])) {
+      re.lastIndex = m.index + 1;
+      continue;
+    }
+    out += s.slice(last, m.index)
+        + (typeof repl === 'function' ? repl(...m) : repl);
+    last = m.index + m[0].length;
+    if (m[0].length === 0) re.lastIndex++;
+  }
+  return out + s.slice(last);
+}
+
+/** Typing helpers: let the user write plain ASCII on a normal keyboard. */
+function normalize(src) {
+  let s = String(src)
+    .replace(/\r\n?/g, '\n')
+    .replace(/->/g, '→').replace(/=>/g, '⇒')
+    .replace(/<=/g, '≤').replace(/>=/g, '≥').replace(/<>/g, '≠')
+    .replace(/~/g, '◢').replace(/[⌐_]/g, '」')
+    // A keyboard has / and *, the machine has ÷ and ×. Nothing else in this
+    // language uses either character, and both are one byte either way.
+    .replace(/d\/dx\s*\(/gi, 'd∕dx(')
+    .replace(/\//g, '÷').replace(/\*/g, '×')
+    .replace(/d∕dx\(/g, 'd/dx(')
+    // Every dash comes in as the plain one — en dash and em dash (phone and
+    // Mac autocorrect), and the long bar itself. longMinus() below is the one
+    // thing that decides which of the two the machine would draw.
+    .replace(/[–—−]/g, '-')
+    // The inverse trig keys are ONE key each on the machine (SHIFT sin, …), so
+    // they must be typeable without hunting for the ⁻¹ character. Accept
+    // 'cos-1(', 'cos^-1(' and 'acos(' and rewrite them to the real token —
+    // otherwise the program neither compiles nor counts the right bytes.
+    // Note 'sin(-1)' is untouched: the -1 has to come BEFORE the bracket.
+    .replace(/(sinh|cosh|tanh|sin|cos|tan)\s*\^?\s*[-−]\s*1\s*\(/gi, (_, f) => f + '⁻¹(');
+  s = replaceUnlessAfter(s, /x√/gi, 'ˣ√');
+  // A is a calculator variable: Asin( means A × sin(, never inverse sine.
+  s = replaceUnlessAfter(s, /arc(sinh|cosh|tanh|sin|cos|tan)\(/gi, (_, f) => f + '⁻¹(');
+  s = replaceUnlessAfter(s, /a(sinh|cosh|tanh|sin|cos|tan)\(/g, (_, f) => f + '⁻¹(');
+  s = replaceUnlessAfter(s, /cbrt\(/gi, '³√(');
+  s = replaceUnlessAfter(s, /sqrt\(/gi, '√(');
+  s = replaceUnlessAfter(s, /pi(?![A-Za-z])/gi, 'π');
+  for (const [re, w] of CANON_RE) s = replaceUnlessAfter(s, re, w);
+  const savedReg=[];
+  s=s.replace(/Σx²y|Σxy|ȳ|x̂|ŷ/g,t=>{ savedReg.push(t);return String.fromCharCode(0xe100+savedReg.length-1); });
+  // lone letters are variable names, which the machine only has in upper case.
+  // Σx / σx / x̄ are statistics TOKENS, not a variable — their lower-case x has
+  // to survive, or the lexer sees ΣX and reports a Syntax ERROR. Hence the two
+  // extra guards: Σ and σ in front, the combining macron of x̄ behind.
+  s = replaceUnlessAfter(s, /[abcdxym](?![A-Za-zμ₀\u0304]|\/dx\()/g,
+    c => c.toUpperCase(), /[A-Za-zπΣσλμ]/);
+  // A lone 'r' is the radian unit, not a variable — this machine only has
+  // A B C D X Y M. Nixon writes "π r − D − Y → X" for the third angle of a
+  // triangle, meaning π radians. Keywords are canonical by this point, so the
+  // letter guards leave Rad / Rec( / Ran# / arg( / For / Break / Norm alone.
+  s = replaceUnlessAfter(s, /r(?![A-Za-z])/g, 'ʳ');
+  s=s.replace(/[\ue100-\uf8ff]/g,c=>savedReg[c.charCodeAt(0)-0xe100] || c);
+  return longMinus(s);
+}
+
+// A keyboard has one minus key; the machine has two, and draws them
+// differently — `−` (five dots) for a subtraction, `-` (three) for a sign.
+// Which one it is depends on what comes before: after something a VALUE can end
+// with it is a subtraction, anywhere else it is a sign. Nixon, 2026-09-19:
+// `B²−4AC` is a subtraction, the `-B` of `-B÷2A` is a sign.
+//
+// Getting this wrong is only cosmetic — the lexer reads `−` and `-` as the same
+// operator and both cost one byte — with ONE exception that is not cosmetic at
+// all: the `-` of an exponent (`ᴇ-4`) is part of the NUMBER, and the number
+// pattern only accepts ASCII, so that one must never be touched.
+const VALUE_END = ')²³¹!°ʳᵍ#π%';
+const NOT_A_VALUE = /^(?:While|WhileEnd|If|Then|Else|IfEnd|For|To|Step|Next|Break|Goto|Lbl|Prog|Deg|Rad|Gra|Fix|Sci|Norm|ClrMemory|ClrStat|Scl)$/;
+function longMinus(s) {
+  let out = '';
+  for (let i = 0; i < s.length; i++) {
+    if (s[i] !== '-') { out += s[i]; continue; }
+    let j = i - 1;
+    while (j >= 0 && s[j] === ' ') j--;
+    const p = j < 0 ? '' : s[j];
+    // ⚠️ the p !== '' guard is not decoration: ''.includes('') is true, so a
+    // minus at the very start of a program read as a subtraction without it.
+    let binary = p !== '' && (/[0-9]/.test(p) || VALUE_END.includes(p));
+    if (/[A-Za-z]/.test(p)) {           // a word: a variable or Ans is a value,
+      let k = j;                        // a keyword is not
+      while (k >= 0 && /[A-Za-z]/.test(s[k])) k--;
+      binary = !NOT_A_VALUE.test(s.slice(k + 1, j + 1));
+    }
+    if (p === 'ᴇ' || p === 'E') binary = false;      // the sign of an exponent
+    out += binary ? '−' : '-';
+  }
+  return out;
+}
+
+// A newline in the editor separates statements like ':' but is pure layout —
+// it costs no bytes, so you can lay a program out without paying for it.
+
+// ------------------------------------------------------------------ scanner
+/** Every token carries `p`, its offset in the normalized program text, so an
+ *  error can point at the exact character instead of just naming itself. */
+function scan(src) {
+  const s = normalize(src);
+  const out = [];
+  let buf = '', bufAt = 0;
+  const flush = () => {
+    if (buf.trim()) {
+      const lead = buf.length - buf.trimStart().length;   // skip leading spaces
+      out.push({ t: 'expr', v: buf.trim(), p: bufAt + lead });
+    }
+    buf = '';
+  };
+  for (let i = 0; i < s.length;) {
+    const c = s[i];
+    if (c === ':') { flush(); out.push({ t: 'sep', p: i }); i++; continue; }
+    if (c === '\n') { flush(); out.push({ t: 'sep', free: true, p: i }); i++; continue; }
+    if (c === '◢') { flush(); out.push({ t: 'disp', p: i }); i++; continue; }
+    if (c === '⇒') { flush(); out.push({ t: 'arrow', p: i }); i++; continue; }
+    const prev = s[i - 1];
+    if (!prev || !/[A-Za-z]/.test(prev)) {
+      const rest = s.slice(i);
+      const kw = KW.find(k => rest.startsWith(k) && !/[A-Za-z]/.test(rest[k.length] || ''));
+      if (kw) { flush(); out.push({ t: 'kw', v: kw, p: i }); i += kw.length; continue; }
+    }
+    if (!buf) bufAt = i;
+    buf += c; i++;
+  }
+  flush();
+  return out;
+}
+
+/** Program size in bytes — one byte per token, as on the machine.
+ *  Checked against the byte counts printed in Nixon's published programs
+ *  (Submitted/CASIO-All-8-Prog): all eight totals match exactly. */
+function byteCount(src) {
+  let n = 0;
+  for (const t of scan(src)) {
+    if (t.free) continue;                       // line breaks are free
+    if (t.t === 'expr') {
+      const m = MEM_RE.exec(t.v);
+      n += m ? countExpr(m[1]) + 1 : countExpr(t.v);   // M+ / M− is one key
+    } else n += 1;
+  }
+  return n;
+}
+function countExpr(src) {
+  // count engine tokens; digits count individually
+  let n = 0;
+  const s = src.replace(/\s+/g, '');
+  // Longest first. The ∧ and ˣ√ keys each type an opening bracket with them,
+  // so "^(" and "ˣ√(" cost one byte, not two — as Nixon's byte listings show.
+  const multi = [...SCI_NAMES,'sinh⁻¹(', 'cosh⁻¹(', 'tanh⁻¹(', 'sin⁻¹(', 'cos⁻¹(', 'tan⁻¹(', 'sinh(', 'cosh(',
+    'tanh(', 'sin(', 'cos(', 'tan(', 'log(', 'ln(', 'e^(', '10^(', '³√(', '√(', 'Abs(', 'Rnd(',
+    'Pol(', 'Rec(', 'Conjg(', 'arg(', '∫(', 'd/dx(', 'Ran#', 'Ans', 'nPr', 'nCr', 'ˣ√(', 'ˣ√', '^(',
+    '⁻¹', '▸a+bi', '▸r∠θ', 'NA', 'ε₀',
+    // SD statistics tokens: each is one key on the real machine, so one byte
+    // each (Nixon, 2026-09-22: "x̄ same as minX, all 1 byte").  'Σx²' must come
+    // before 'Σx'.  'n' needs no entry — single characters already cost one.
+    // 'σx²' is the σx key then the x² key, so it stays two bytes.
+    'regA','regB','regR','Σx²y','Σx³','Σx⁴','Σxy','Σy²','Σy','ȳ','σy','sy','x̂','ŷ','Σx²', 'Σx', 'x̄', 'σx', 'sx', 'minX', 'maxX'].sort((a,b)=>b.length-a.length);
+  for (let i = 0; i < s.length;) {
+    const rest = s.slice(i);
+    const m = multi.find(k => rest.startsWith(k));
+    if (m) { n++; i += m.length; continue; }
+    n++; i++;
+  }
+  return n;
+}
+
+// ----------------------------------------------------------------- compiler
+function compile(src) {
+  const T = scan(src);
+  // The machine shows the source text of the statement it is displaying on the
+  // upper line while a ◢ holds — Nixon's 2026-08-09 recording reads
+  // "Then B²-4AC", "-B÷2A→X", "C-AX²→Y". The span runs from just after the
+  // previous separator (':', newline or an earlier ◢) up to this ◢, so a
+  // leading `Then` is kept and the ':' itself is not.
+  const S = normalize(src);
+  let segStart = 0;
+  const code = [], labels = {}, blocks = [];
+  let arrow = null;
+  const emit = ins => (code.push(ins), code.length - 1);
+  const loop = () => { for (let i = blocks.length - 1; i >= 0; i--) if (blocks[i].breaks) return blocks[i]; return null; };
+  const closeArrow = () => { if (arrow !== null) { code[arrow].target = code.length; arrow = null; } };
+  // returns the token, so callers can report where a missing operand should be
+  const nextTok = (i, after) => {
+    const t = T[i];
+    if (!t || t.t !== 'expr') pSynErr(t ? t.p : (after != null ? after : undefined));
+    return t;
+  };
+  const nextExpr = (i, after) => nextTok(i, after).v;
+
+  for (let i = 0; i < T.length; i++) {
+    const t = T[i];
+
+    if (t.t === 'sep') { segStart = t.p + 1; closeArrow(); continue; }
+    if (t.t === 'disp') {
+      emit({ op: 'DISP', at: t.p, text: S.slice(segStart, t.p).trim() });
+      segStart = t.p + 1;
+      closeArrow();
+      continue;
+    }
+    if (t.t === 'arrow') {
+      const last = code[code.length - 1];
+      if (!last || last.op !== 'EXPR') pSynErr(t.p);
+      last.op = 'JZ'; last.target = -1;
+      arrow = code.length - 1;
+      continue;
+    }
+    if (t.t === 'expr') {
+      const m = /^\?\s*→\s*([A-DXYM])$/.exec(t.v);
+      if (m) emit({ op: 'INPUT', name: m[1], at: t.p });
+      else if (t.v.includes('?')) pSynErr(t.p); // Input must name a calculator variable.
+      // The segment text rides along on EXPR too: when a program stops, the
+      // machine leaves the LAST statement on the upper line even though it has
+      // no ◢ (REAL, fx50-test-Prog1.mov ends on 'X-C→B' with its value showing).
+      else emit({ op: 'EXPR', src: t.v, at: t.p, text: S.slice(segStart, t.p + t.v.length).trim() });
+      continue;
+    }
+
+    switch (t.v) {
+      case 'If': {
+        // Nesting limits, SPEC §10. Nixon confirmed on the machine that an If
+        // inside an If is a Syntax ERROR. Same-type loop nesting is also
+        // forbidden (Nixon, 2026-10-05); mixed For/While is unverified.
+        if (blocks.some(b => b.type === 'if')) pSynErr(t.p);
+        const ct = nextTok(++i, t.p);
+        // REAL, Nixon 2026-10-06: evaluating an If condition preserves Ans.
+        // While also preserves Ans; the conditional arrow updates it.
+        blocks.push({ type: 'if', jz: emit({ op: 'JZ', src: ct.v, at: ct.p, target: -1, preserveAns: true }), jmp: null });
+        break;
+      }
+      case 'Then': break;                                  // marks the true branch
+      case 'Else': {
+        const b = blocks[blocks.length - 1];
+        if (!b || b.type !== 'if') pSynErr(t.p);
+        b.jmp = emit({ op: 'JMP', target: -1 });
+        code[b.jz].target = code.length;
+        break;
+      }
+      case 'IfEnd': {
+        const b = blocks.pop();
+        if (!b || b.type !== 'if') pSynErr(t.p);
+        if (b.jmp !== null) code[b.jmp].target = code.length;
+        else code[b.jz].target = code.length;
+        break;
+      }
+      case 'While': {
+        if (blocks.some(b => b.type === 'while' || b.type === 'for')) pSynErr(t.p); // Same-type forbidden; mixed For/While remains unverified.
+        const top = code.length;
+        const ct = nextTok(++i, t.p);
+        blocks.push({ type: 'while', top, jz: emit({ op: 'JZ', src: ct.v, at: ct.p, target: -1, preserveAns: true }), breaks: [] });
+        break;
+      }
+      case 'WhileEnd': {
+        const b = blocks.pop();
+        if (!b || b.type !== 'while') pSynErr(t.p);
+        emit({ op: 'JMP', target: b.top });
+        code[b.jz].target = code.length;
+        b.breaks.forEach(x => { code[x].target = code.length; });
+        break;
+      }
+      case 'For': {
+        if (blocks.some(b => b.type === 'while' || b.type === 'for')) pSynErr(t.p); // No For inside While or For.
+        const it = nextTok(++i, t.p);
+        const initSrc = it.v;
+        const vm = /→\s*([A-DXYM])\s*$/.exec(initSrc);
+        if (!vm) pSynErr(it.p);
+        emit({ op: 'EXPR', src: initSrc, at: it.p });
+        if (!T[++i] || T[i].t !== 'kw' || T[i].v !== 'To') pSynErr(t.p);
+        const endSrc = nextExpr(++i, t.p);
+        let stepSrc = '1';
+        if (T[i + 1] && T[i + 1].t === 'kw' && T[i + 1].v === 'Step') { i++; stepSrc = nextExpr(++i, t.p); }
+        const top = code.length;
+        blocks.push({
+          type: 'for', top, varName: vm[1], stepSrc, breaks: [],
+          test: emit({ op: 'FORTEST', varName: vm[1], endSrc, stepSrc, at: it.p, target: -1 }),
+        });
+        break;
+      }
+      case 'Next': {
+        const b = blocks.pop();
+        if (!b || b.type !== 'for') pSynErr(t.p);
+        emit({ op: 'FORNEXT', varName: b.varName, stepSrc: b.stepSrc, top: b.top });
+        code[b.test].target = code.length;
+        b.breaks.forEach(x => { code[x].target = code.length; });
+        break;
+      }
+      case 'Break': {
+        const b = loop();
+        if (!b) pSynErr(t.p);
+        b.breaks.push(emit({ op: 'JMP', target: -1 }));
+        break;
+      }
+      case 'Goto': emit({ op: 'GOTO', n: nextExpr(++i, t.p).trim(), at: t.p }); break;
+      case 'Lbl': labels[nextExpr(++i, t.p).trim()] = code.length; break;
+      case 'Fix': case 'Sci': emit({ op: 'SETUP', cmd: t.v, arg: nextExpr(++i, t.p).trim(), at: t.p }); break;
+      case 'Norm': emit({ op: 'SETUP', cmd: 'Norm', arg: nextExpr(++i, t.p).trim(), at: t.p }); break;
+      default: emit({ op: 'SETUP', cmd: t.v, at: t.p }); break;   // Deg/Rad/Gra/ClrMemory/…
+    }
+  }
+  // IfEnd may be left off the end of a program — the machine accepts it and the
+  // If simply runs to the end (SPEC §10). Five of Nixon's eight published
+  // programs end this way. For/While still have to be closed.
+  while (blocks.length && blocks[blocks.length - 1].type === 'if') {
+    const b = blocks.pop();
+    code[b.jmp !== null ? b.jmp : b.jz].target = code.length;
+  }
+  if (blocks.length) pSynErr(code[blocks[0].jz ?? blocks[0].test]?.at);  // For/While never closed
+  closeArrow();
+  return { code, labels };
+}
+
+// ---------------------------------------------------------------- interpreter
+// A generator: yields {type:'input'|'disp'} and is resumed by the UI.
+/** Run `fn`, and if it fails, tag the error with where in the program text it
+ *  happened: the instruction's own offset plus the offset inside its expression.
+ *  That is what lets the editor put the cursor on the offending character. */
+function locate(I, fn) {
+  try { return fn(); } catch (e) {
+    if (e instanceof CalcError && e.progPos == null && I.at != null) {
+      e.progPos = I.at + (e.pos ?? 0);
+    }
+    throw e;
+  }
+}
+
+/** `opts.tick` = instructions per slice. With it the runner yields
+ *  {type:'tick'} that often, so an interactive caller can hand the browser its
+ *  event loop back between slices and AC still gets through — which is what the
+ *  machine does: it runs until you stop it, for ever if you like.
+ *
+ *  Nixon, 2026-09-26: he writes infinite loops ON PURPOSE (his vector product
+ *  program is built on it, and the Co-Geo centre/radius loop in CLAUDE.md §19
+ *  is meant to be pressed EXE through until AC). Neither official error table
+ *  — ours in SPEC §11, nor the fx-3650P II manual's — has a "Time ERROR": we
+ *  invented one and used it to cut his own programs off at 3×10⁶ steps.
+ *
+ *  Without `tick` nobody is keeping a page alive, so the count guard stays as a
+ *  safety net for the test suites. That is a harness limit, not the machine. */
+function* run(program, ctx, opts = {}) {
+  const { code, labels } = program;
+  const tick = opts.tick | 0;
+  let pc = 0, guard = 0, displayedValue = ctx.vars.Ans;
+  while (pc < code.length) {
+    if (tick) { if (++guard >= tick) { guard = 0; yield { type: 'tick' }; } }
+    else if (++guard > 3e6) throw new CalcError('Time ERROR');
+    const I = code[pc];
+    switch (I.op) {
+      case 'EXPR':
+        if(ctx.mode==='REG' && code[pc+1]?.op==='SETUP' && code[pc+1].cmd==='DT') {
+          displayedValue=locate(I,()=>addRegressionData(ctx,I.src)); pc+=2; break;
+        }
+        ctx.lastStmt = I.text || ''; displayedValue = locate(I, () => calcStmt(I.src, ctx).value); pc++; break;
+      case 'INPUT': {
+        const v = yield { type: 'input', name: I.name };
+        if (I.name !== 'Ans') ctx.vars[I.name] = v;
+        ctx.vars.Ans = v; displayedValue = v; pc++; break;
+      }
+      // A condition can be displayed without becoming Ans. Nixon's realCal:
+      // 2:While Ans²◢Ans+1◢WhileEnd shows 4,3,9,4,..., not 4,5,25,26,...
+      case 'DISP': yield { type: 'disp', value: displayedValue, text: I.text }; pc++; break;
+      case 'JZ': {
+        const savedAns = ctx.vars.Ans;
+        let v;
+        try { v = locate(I, () => calcStmt(I.src, ctx).value); }
+        finally { if (I.preserveAns) ctx.vars.Ans = savedAns; }
+        if (valueIsComplex(v)) locate(I, () => { throw new CalcError('Math ERROR'); });
+        displayedValue = v;
+        pc = v.isZero() ? I.target : pc + 1;
+        break;
+      }
+      case 'JMP': pc = I.target; break;
+      case 'GOTO': {
+        const t = labels[I.n];
+        if (t === undefined) locate(I, () => { throw new CalcError('Go ERROR'); });
+        pc = t; break;
+      }
+      case 'FORTEST': {
+        const cur = ctx.vars[I.varName];
+        const end = locate(I, () => evaluate(I.endSrc, ctx));
+        const st = locate(I, () => evaluate(I.stepSrc, ctx));
+        // REAL: negative-Step direction is assumed, not yet verified on the machine
+        const done = st.s >= 0 ? cmp(cur, end) > 0 : cmp(cur, end) < 0;
+        pc = done ? I.target : pc + 1;
+        break;
+      }
+      case 'FORNEXT':
+        ctx.vars[I.varName] = add(ctx.vars[I.varName], locate(I, () => evaluate(I.stepSrc, ctx)));
+        pc = I.top; break;
+      case 'SETUP': locate(I, () => applySetup(I, ctx)); pc++; break;
+      default: pc++;
+    }
+  }
+  return ctx.vars.Ans;
+}
+
+function applySetup(I, ctx) {
+  const n = I.arg ? parseInt(I.arg, 10) : 0;
+  switch (I.cmd) {
+    case 'Deg': ctx.angle = 'deg'; break;
+    case 'Rad': ctx.angle = 'rad'; break;
+    case 'Gra': ctx.angle = 'gra'; break;
+    case 'Fix': ctx.disp = { disp: 'fix', n }; break;
+    case 'Sci': ctx.disp = { disp: 'sci', n: n === 0 ? 10 : n }; break;
+    case 'Norm': ctx.disp = { disp: n === 2 ? 'norm2' : 'norm1' }; break;
+    case 'ClrMemory': for (const k of ['A', 'B', 'C', 'D', 'X', 'Y', 'M']) ctx.vars[k] = evaluate('0', ctx); break;
+    // DT enters one sample — exactly what pressing M+ does in SD mode with that
+    // value on the entry line (Nixon, 2026-09-22: "DT same as pressing M+, 3
+    // numbers in"). So "1DT:2DT:6DT" enters three numbers and x̄ then reads 3.
+    // The value is whatever the statement in front of it worked out, i.e. Ans.
+    case 'FreqOn': ctx.freqOn=true; break;
+    case 'FreqOff': ctx.freqOn=false; break;
+    case 'DT':
+      if(ctx.mode==='REG') { addRegressionData(ctx,''); break; }
+      if (valueIsComplex(ctx.vars.Ans)) throw new CalcError('Math ERROR');
+      (ctx.stat ||= []).push({ v: ctx.vars.Ans, f: 1 });
+      break;
+    case 'ClrStat': (ctx.stat ||= []).length = 0; break;
+    // ⚠️ Not done: the frequency form. On the keys it is "value SHIFT , n M+",
+    // so in a program it would read "1;5DT" — but ';' inside a program
+    // expression is a Syntax ERROR today and Nixon has not been asked whether
+    // the machine takes it. Being more permissive than the machine is a bug
+    // here, so this waits for his answer rather than a guess.
+    default: break;                    // FreqOn/Dec/Hex… belong to modes not built yet
+  }
+}
+
+const TOTAL_BYTES = 680;
+
+// Portable program files shared by the workbench and both calculators.
+const FILE_MODES = ['COMP', 'CMPLX', 'BASE', 'SD', 'REG'];
+const FILE_ANGLES = ['deg', 'rad', 'gra'];
+function readProgramComments(p) {
+  return p.comments.filter(n => n && typeof n.text === 'string'
+    && Number.isInteger(n.start) && Number.isInteger(n.end)
+    && n.start >= 0 && n.end >= n.start && n.end <= p.src.length)
+    .map((n,i) => ({id:typeof n.id === 'string' ? n.id : `comment-${i}`,
+      start:n.start,end:n.end,text:n.text,quote:typeof n.quote === 'string' ? n.quote : p.src.slice(n.start,n.end),
+      ...(n.detached ? {detached:true} : {})}));
+}
+
+function readProgramRecords(data) {
+  const list = Array.isArray(data) ? data : data && data.progs;
+  if (!Array.isArray(list)) throw new Error('檔案內沒有程式清單');
+  if (list.length && list.every(p => typeof p === 'string')) {
+    return list.map((src, i) => ({ name: `計數機 P${i + 1}`, src,
+      mode: FILE_MODES.includes(data.pmodes && data.pmodes[i]) ? data.pmodes[i] : 'COMP',
+      note: '', status: 'draft', angle: 'deg' }));
+  }
+  if (!list.every(p => p && typeof p === 'object' && typeof p.src === 'string'))
+    throw new Error('程式格式不正確；未有更改任何程式');
+  return list.map(p => ({
+    id: typeof p.id === 'string' ? p.id : '', name: String(p.name || '未命名'),
+    src: p.src, mode: FILE_MODES.includes(p.mode) ? p.mode : 'COMP',
+    note: String(p.note || ''), ...(p.guide && typeof p.guide === 'object' ? {guide: Object.fromEntries(['id','inputs','outputs','example','caution'].filter(k => typeof p.guide[k] === 'string').map(k => [k,p.guide[k]]))} : {}), ...(Array.isArray(p.comments) ? {comments:readProgramComments(p)} : {}), ...(typeof p.remarks === 'string' ? {remarks:p.remarks} : {}), status: p.status === 'complete' ? 'complete' : 'draft',
+    angle: FILE_ANGLES.includes(p.angle) ? p.angle : 'deg',
+    updated: typeof p.updated === 'string' ? p.updated : '',
+  }));
+}
+
+function makeProgramFile(progs, selected = null) {
+  return { v: 2, app: 'fx50-library', selected, progs };
+}
+
+
+
+// Nixon's existing four programs, with independently written teaching notes.
+
+const TEACHING_PROGRAMS = [
+  {
+    "id": "teaching-quadratic-v1",
+    "name": "二次方程與頂點",
+    "src": "?→A:?→B:?→C:\nB²−4AC◢-B÷2A→X◢C−AX²→Y◢\n-Y」A→C:X+√(C→A◢X−√(C→B",
+    "mode": "CMPLX",
+    "angle": "deg",
+    "status": "complete",
+    "note": "輸入 ax²+bx+c=0 的係數。",
+    "guide": {
+      "id": "quadratic",
+      "inputs": "A=a、B=b、C=c，依次按 EXE。",
+      "outputs": "判別式 → 頂點 x → 頂點 y → 第一根 → 第二根。",
+      "example": "2x²−3x−5=0：輸入 2、−3、−5；依次得到 49、0.75、−6.125、2.5、−1。",
+      "caution": "A 不能為 0；用 CMPLX。"
+    }
+  },
+  {
+    "id": "teaching-linear-v1",
+    "name": "二元一次聯立方程",
+    "src": "?→A:?→B:?→C:?→X:?→Y:?→D:\nCY−BD:Ans÷(BX−AY→X◢−B⁻¹(C+AX→Y",
+    "mode": "COMP",
+    "angle": "deg",
+    "status": "complete",
+    "note": "解 Ax+By+C=0、Xx+Yy+D=0。",
+    "guide": {
+      "id": "linear",
+      "inputs": "依次輸入 A、B、C、X、Y、D；X、Y 此處是第二式係數。",
+      "outputs": "未知數 x → 未知數 y。",
+      "example": "x+y=5、x−y=1：輸入 1、1、−5、1、−1、−1；得到 3、2。",
+      "caution": "此寫法要求 B≠0，且兩式有唯一解；先把方程移到左邊。"
+    }
+  },
+  {
+    "id": "teaching-triangle-v1",
+    "name": "三角形角度與面積",
+    "src": "?→A:?→B:?→C:?→D:\nC⇒cos⁻¹((A²+B²−C²)÷2AB→D:\nPol(A−Bcos(D,Bsin(D→C:C◢D◢180−Y−D→X◢Y◢2⁻¹ABsin(D→M",
+    "mode": "COMP",
+    "angle": "deg",
+    "status": "complete",
+    "note": "三邊求角，或兩邊及夾角求其餘資料。",
+    "guide": {
+      "id": "triangle",
+      "inputs": "A、B 為兩邊；C 為對邊，D 為夾角。三邊已知時 D 輸入 0；夾角已知時 C 輸入 0。",
+      "outputs": "對邊 C → 夾角 D → 其餘兩角 → 面積。",
+      "example": "3、4、5 三角形：輸入 3、4、5、0；得到 5、90、約 36.86989764、約 53.13010236、6。",
+      "caution": "先用 SETUP 設為 DEG；只適用非退化、有效三角形。"
+    }
+  },
+  {
+    "id": "teaching-polynomial-v1",
+    "name": "多項式係數",
+    "src": "ᴇ-4i→X:?→M:While Abs(M:Fix0:Rnd(M:Norm1:\nAns+Conjg(Ans:Ans÷2◢X⁻¹(M−Ans→M:WhileEnd",
+    "mode": "CMPLX",
+    "angle": "deg",
+    "status": "complete",
+    "note": "讀出以 X 表示的多項式係數。",
+    "guide": {
+      "id": "polynomial",
+      "inputs": "M? 輸入多項式，例如 (2X+1)³。",
+      "outputs": "常數項 → X 項 → X² 項 → X³ 項……；EXE 顯示下一項，AC 中止。",
+      "example": "輸入 (2X+1)³，依次得到 1、6、12、8。",
+      "caution": "用 CMPLX；這是數值方法，先用低次、整數係數例子核對，並非任意多項式的符號展開。"
+    }
+  }
+];
+function teachingMatch(src) {
+  const canonical = s => normalize(String(s || '')).replace(/\n/g, '').trim();
+  return TEACHING_PROGRAMS.find(p => canonical(p.src) === canonical(src));
+}
+
+
+// Built-in research templates; never overwrite user edits.
+const LP_LITERAL_EXAMPLES = [
+  {
+    "id": "lp-literal-goto-interior-184-v1",
+    "name": "LP 單一 While／Goto · 184B固定碼 · 複數係數輸入",
+    "src": "?→A:?→B:1→D:\nLbl 0:\n-A→A:-90cos(arg(D→D:0→C:\nLbl 1:\nNAi→M:\nWhile 0<arg(M:\nε₀>arg(M⇒-M→M:\n.5(B+A(tan(C-ε₀arg(M))i+1)Abs(M+Conjg(M→X:\ni(Conjg(X)-X→Y:X+Conjg(X→X:\n(X≥1)(X+Y≥5)(2X-Y≤7)(X+2Y≤17→X:\n.25(1-i+2iX)(M-Conjg(M M−:\nWhileEnd:\nD÷2→D:C+(2X-1)Abs(D→C:\nσ<Abs(D⇒Goto 1:\n.5AConjg(B)+Abs(A²M→M:Conjg(M M+:\nMcos(arg(D◢\nGoto 0\n",
+    "mode": "CMPLX",
+    "angle": "deg",
+    "status": "draft",
+    "updated": "2026-10-05",
+    "note": "只有一層 While；外兩層改用 Goto／Lbl。A?輸入p+qi，例如3+2i。B?輸入嚴格內點，例如2+4i。先min，EXE後max，AC停止。",
+    "remarks": "固定碼184 bytes，本例限制21 bytes，整條205 bytes。保留 Conjg(M M+。數值近似；需要嚴格內點，不處理不可行或零面積區域。NA為人工搜尋上限，巨大輸出不是普遍無界證明。共享引擎驗證；仍未真機覆核／計時。"
+  },
+  {
+    "id": "lp-literal-goto-interior-196-v1",
+    "name": "LP 單一 While／Goto · 196B固定碼 · 原句目標",
+    "src": "1→X:i→Y:3X+2Y→A:?→B:X→D:\nLbl 0:\n-A→A:-90cos(arg(D→D:0→C:\nLbl 1:\nNAi→M:\nWhile 0<arg(M:\nε₀>arg(M⇒-M→M:\n.5(B+A(tan(C-ε₀arg(M))i+1)Abs(M+Conjg(M→X:\ni(Conjg(X)-X→Y:X+Conjg(X→X:\n(X≥1)(X+Y≥5)(2X-Y≤7)(X+2Y≤17→X:\n.25(1-i+2iX)(M-Conjg(M M−:\nWhileEnd:\nD÷2→D:C+(2X-1)Abs(D→C:\nσ<Abs(D⇒Goto 1:\n.5AConjg(B)+Abs(A²M→M:Conjg(M M+:\nMcos(arg(D◢\nGoto 0\n",
+    "mode": "CMPLX",
+    "angle": "deg",
+    "status": "draft",
+    "updated": "2026-10-05",
+    "note": "只有一層 While；外兩層改用 Goto／Lbl。修改3X+2Y→A。B?輸入嚴格內點，例如2+4i。先min，EXE後max，AC停止。",
+    "remarks": "固定碼196 bytes，本例限制21 bytes，整條217 bytes。保留 Conjg(M M+。數值近似；需要嚴格內點，不處理不可行或零面積區域。NA為人工搜尋上限，巨大輸出不是普遍無界證明。共享引擎驗證；仍未真機覆核／計時。"
+  },
+  {
+    "id": "lp-literal-while-interior-192-v1",
+    "name": "停用：LP While · 192B固定碼 · 原句目標",
+    "src": "1→X:i→Y:3X+2Y→A:?→B:X→D:\nWhile 1:\n-A→A:-90cos(arg(D→D:0→C:\nWhile σ<Abs(D:\nNAi→M:\nWhile 0<arg(M:\nε₀>arg(M⇒-M→M:\n.5(B+A(tan(C-ε₀arg(M))i+1)Abs(M+Conjg(M→X:\ni(Conjg(X)-X→Y:X+Conjg(X→X:\n(X≥1)(X+Y≥5)(2X-Y≤7)(X+2Y≤17→X:\n.25(1-i+2iX)(M-Conjg(M M−:\nWhileEnd:\nD÷2→D:C+(2X-1)Abs(D→C:\nWhileEnd:\n.5AConjg(B)+Abs(A²M→M:Conjg(M M+:\nMcos(arg(D◢\nWhileEnd\n",
+    "mode": "CMPLX",
+    "angle": "deg",
+    "status": "draft",
+    "updated": "2026-10-05",
+    "note": "不能在真機執行：含巢狀 While。模擬器以前錯誤地容許；請用單一 While／Goto 版本。",
+    "remarks": "已撤回真機候選資格（2026-10-05）。舊測試只證明寬鬆模擬器的輸出，不能證明硬件可執行。\n四條限制固定碼192 bytes；本例不等式21 bytes；整條213 bytes。不等式括號及控制流程算入固定碼。192B含本例目標3X+2Y。需要嚴格內點；数值近似解，不支援不可行或零面積區域。NA、σ、ε₀為科學常數24/31/32，各一byte。無界以巨大正負數提示，不是普遍無界判別器。目標有常數項時輸出自行加回。尚未真機覆核或計時。"
+  },
+  {
+    "id": "lp-literal-while-interior-180-v1",
+    "name": "停用：LP While · 180B固定碼 · 複數係數輸入",
+    "src": "?→A:?→B:1→D:\nWhile 1:\n-A→A:-90cos(arg(D→D:0→C:\nWhile σ<Abs(D:\nNAi→M:\nWhile 0<arg(M:\nε₀>arg(M⇒-M→M:\n.5(B+A(tan(C-ε₀arg(M))i+1)Abs(M+Conjg(M→X:\ni(Conjg(X)-X→Y:X+Conjg(X→X:\n(X≥1)(X+Y≥5)(2X-Y≤7)(X+2Y≤17→X:\n.25(1-i+2iX)(M-Conjg(M M−:\nWhileEnd:\nD÷2→D:C+(2X-1)Abs(D→C:\nWhileEnd:\n.5AConjg(B)+Abs(A²M→M:Conjg(M M+:\nMcos(arg(D◢\nWhileEnd\n",
+    "mode": "CMPLX",
+    "angle": "deg",
+    "status": "draft",
+    "updated": "2026-10-05",
+    "note": "不能在真機執行：含巢狀 While。模擬器以前錯誤地容許；請用單一 While／Goto 版本。",
+    "remarks": "已撤回真機候選資格（2026-10-05）。舊測試只證明寬鬆模擬器的輸出，不能證明硬件可執行。\n四條限制固定碼180 bytes；本例不等式21 bytes；整條201 bytes。不等式括號及控制流程算入固定碼。180B需複數係數輸入；保留原句目標的版本仍是192B。需要嚴格內點；数值近似解，不支援不可行或零面積區域。NA、σ、ε₀為科學常數24/31/32，各一byte。無界以巨大正負數提示，不是普遍無界判別器。目標有常數項時輸出自行加回。尚未真機覆核或計時。"
+  },
+  {
+    "id": "lp-literal-four-v1",
+    "name": "LP 原句版 · 4條限制（真機候選）",
+    "src": "9!-i→M:\nLbl 3:\n-8!→X:Goto 8:\nLbl 0:\nX+i((X≥1)+2(X+Y≥5)+4(2X-Y≤7)+8(X+2Y≤17→X:\nLbl 1:\nAbs(M-Conjg(M))>8⇒Goto 7:\nAbs(M-Conjg(M))÷2→Y:\n(X-Conjg(X))÷2i→X:\nsin(360(X+.5)÷2^Y)<0→X:\nIf arg(M)<0:Then 8!(1-2X)(1-i→D:Conjg(M→M:Goto 2:IfEnd:\n((3+i(1-2X))D+(1-2X+i)Conjg(D))÷4→D:\nLbl 2:\n((1-i)D+(1+i)Conjg(D))÷4→X:\nAbs((1-i)D-(1+i)Conjg(D))≤2ᴇ-10⇒Goto 4:\nLbl 8:\nπX+(Abs(M)<9!→Y:\nGoto 0:\nLbl 4:\nIf Abs(M)>9!:Then X-iAbs(M-Conjg(M))÷2→M:Goto 3:IfEnd:\n(M+Conjg(M))÷2-X→Y:\n1-πY+iY→X:\n(arg((1-i)D)<0)→Y:\n(arg(X)+180Y)÷2+i(1-2Y)(M+Conjg(M))÷4Abs(X→D:\nAbs(M-Conjg(M))÷2→Y:\nD→M:C→D:B→C:A→B:M→A:\nY=4⇒Goto 5:\n9!-i(Y+1→M:Goto 3:\nLbl 5:\n1→X:i→Y:\n3X+2Y→M:\nFor 1→Y To 4:\nA→X:B→A:C→B:D→C:\nX-arg(M)÷2+(Abs(M)-1)(X-Conjg(X))÷2→D:\nNext:\n-67!→X:\nFor -10→Y To8:A+Conjg(A→M:\nIf 0=sin(M:Then 90→M:\nElse 0≤sin(M)sin(B+Conjg(B⇒Goto 9:B+Conjg(B→M:IfEnd:\n1ᴇ-11≥Ysin(M)sin(M−A−Conjg(A⇒Goto 9:\nisin(M−A−Conjg(A:Ans⁻¹(sin(M)A−Bsin(A+Conjg(A→M:Conjg(M M+:0>Y(M−X⇒M→X:\nLbl 9:A→M:B→A:C→B:M→C:\nIf 0=sin(45(Y+1:Then B→M:D→B:M→D:IfEnd:\nIf Y=-1:Then X◢67!→X:IfEnd:\nNext:X\n",
+    "mode": "CMPLX",
+    "angle": "deg",
+    "status": "draft",
+    "note": "直接改原句不等式及目標 pX+qY。先輸出 min，再輸出 max；±67! 代表無界。網頁引擎及打包版已驗證，尚未真機覆核／計時。",
+    "remarks": "改 Lbl 0 的不等式，以及 Lbl 5 的 3X+2Y→M。目標不含常數：例如5X+4Y+28，欄內寫5X+4Y，輸出再加28。X=1、Y=i 用來把 pX+qY 轉成 p+qi。沿 (1,π) 搜尋，適用一般 DSE 有理數係數；邊界兩次探測需落在 ±8! 範圍。不處理不可行問題。編輯後檢查不超過680 bytes（四個程式區共用）。"
+  },
+  {
+    "id": "lp-literal-three-v1",
+    "name": "LP 原句版 · 3條限制（真機候選）",
+    "src": "9!-i→M:\nLbl 3:\n-8!→X:Goto 8:\nLbl 0:\nX+i((X≥1)+2(2X-Y≤7)+4(X+2Y≤17→X:\nLbl 1:\nAbs(M-Conjg(M))>8⇒Goto 7:\nAbs(M-Conjg(M))÷2→Y:\n(X-Conjg(X))÷2i→X:\nsin(360(X+.5)÷2^Y)<0→X:\nIf arg(M)<0:Then 8!(1-2X)(1-i→D:Conjg(M→M:Goto 2:IfEnd:\n((3+i(1-2X))D+(1-2X+i)Conjg(D))÷4→D:\nLbl 2:\n((1-i)D+(1+i)Conjg(D))÷4→X:\nAbs((1-i)D-(1+i)Conjg(D))≤2ᴇ-10⇒Goto 4:\nLbl 8:\nπX+(Abs(M)<9!→Y:\nGoto 0:\nLbl 4:\nIf Abs(M)>9!:Then X-iAbs(M-Conjg(M))÷2→M:Goto 3:IfEnd:\n(M+Conjg(M))÷2-X→Y:\n1-πY+iY→X:\n(arg((1-i)D)<0)→Y:\n(arg(X)+180Y)÷2+i(1-2Y)(M+Conjg(M))÷4Abs(X→D:\nAbs(M-Conjg(M))÷2→Y:\nD→M:C→D:B→C:A→B:M→A:\nY=3⇒Goto 5:\n9!-i(Y+1→M:Goto 3:\nLbl 5:\nA→D:1→X:i→Y:\n3X+2Y→M:\nFor 1→Y To 4:\nA→X:B→A:C→B:D→C:\nX-arg(M)÷2+(Abs(M)-1)(X-Conjg(X))÷2→D:\nNext:\n-67!→X:\nFor -10→Y To8:A+Conjg(A→M:\nIf 0=sin(M:Then 90→M:\nElse 0≤sin(M)sin(B+Conjg(B⇒Goto 9:B+Conjg(B→M:IfEnd:\n1ᴇ-11≥Ysin(M)sin(M−A−Conjg(A⇒Goto 9:\nisin(M−A−Conjg(A:Ans⁻¹(sin(M)A−Bsin(A+Conjg(A→M:Conjg(M M+:0>Y(M−X⇒M→X:\nLbl 9:A→M:B→A:C→B:M→C:\nIf 0=sin(45(Y+1:Then B→M:D→B:M→D:IfEnd:\nIf Y=-1:Then X◢67!→X:IfEnd:\nNext:X\n",
+    "mode": "CMPLX",
+    "angle": "deg",
+    "status": "draft",
+    "note": "直接改原句不等式及目標 pX+qY。先輸出 min，再輸出 max；±67! 代表無界。網頁引擎及打包版已驗證，尚未真機覆核／計時。",
+    "remarks": "改 Lbl 0 的不等式，以及 Lbl 5 的 3X+2Y→M。目標不含常數：例如5X+4Y+28，欄內寫5X+4Y，輸出再加28。X=1、Y=i 用來把 pX+qY 轉成 p+qi。沿 (1,π) 搜尋，適用一般 DSE 有理數係數；邊界兩次探測需落在 ±8! 範圍。不處理不可行問題。編輯後檢查不超過680 bytes（四個程式區共用）。"
+  }
+];
+
+
+// Editor history contains code AND annotation anchors. Never export history.
+const editorCopy = value => JSON.parse(JSON.stringify(value));
+function editorSnapshot(src, comments = [], start = 0, end = start) {
+  return {src, comments: editorCopy(comments), start, end};
+}
+function createEditorHistory(snapshot) {
+  return {entries: [editorCopy(snapshot)], at: 0};
+}
+function editorRemember(history, snapshot) {
+  const current = history.entries[history.at];
+  if (current.src === snapshot.src && JSON.stringify(current.comments) === JSON.stringify(snapshot.comments)) {
+    current.start = snapshot.start; current.end = snapshot.end;
+    return false;
+  }
+  history.entries.splice(history.at + 1);
+  history.entries.push(editorCopy(snapshot));
+  if (history.entries.length > 300) history.entries.shift();
+  history.at = history.entries.length - 1;
+  return true;
+}
+function editorMove(history, direction) {
+  const next = history.at + direction;
+  if (next < 0 || next >= history.entries.length) return null;
+  history.at = next;
+  return editorCopy(history.entries[next]);
+}
+// A textarea input is one replacement, including paste/cut. Outside anchors
+// shift, inside anchors expand/shrink. Deleted sections retain their notes.
+function editorReanchor(comments, before, after) {
+  if (before === after) return editorCopy(comments);
+  let left = 0, suffix = 0;
+  while (left < before.length && left < after.length && before[left] === after[left]) left++;
+  while (suffix < before.length-left && suffix < after.length-left
+    && before[before.length-1-suffix] === after[after.length-1-suffix]) suffix++;
+  const oldEnd = before.length-suffix, newEnd = after.length-suffix, delta = newEnd-oldEnd;
+  return comments.map(note => {
+    const n = {...note};
+    if (n.detached) { n.start = n.end = Math.min(after.length,n.start); return n; }
+    if (oldEnd <= n.start) { n.start += delta; n.end += delta; }
+    else if (left < n.end) {
+      n.start = n.start < left ? n.start : left;
+      n.end = n.end > oldEnd ? n.end+delta : newEnd;
+      if (n.end <= n.start) { n.end = n.start; n.detached = true; }
+    }
+    if (!n.detached) n.quote = after.slice(n.start,n.end);
+    return n;
+  });
+}
+
+
+
+
+
+// fx-50FH II 程式簿 — a workbench for WRITING calculator programs, separate
+// from the calculator itself.
+//
+// Nixon has hundreds of programs and has been keeping them in MS Word: hand
+// colouring the variables, hand shortcuts for the symbols, then keying each one
+// into the real machine to find out whether it even runs. Word cannot count a
+// byte, cannot see a syntax error, and its autocorrect quietly turns a typed
+// "-" into an en dash — the exact character the machine does not have.
+//
+// This page does the three things Word cannot: it counts the bytes as he types,
+// it compiles and points at the character that is wrong, and it RUNS the
+// program against his own worked example, so the loop through the real machine
+// is only for confirming, not for finding typos.
+//
+// Everything is local: the library lives in this browser and in a JSON file he
+// keeps himself. No account, no server.
+
+
+
+
+
+
+const LIB_KEY = 'fx50.library';
+const LIB_MODES = ['COMP', 'CMPLX', 'SD', 'REG', 'BASE'];
+const LIB_TICK = 20000;          // instructions per slice while a program runs
+// One colour per variable, handed out in the order the program first STORES
+// into each — the same idea as the calculator's own editor.
+const LIB_PALETTE = ['#f2b134', '#6ec1e4', '#8fd694', '#e88ab8', '#c0a3f0', '#f0956b', '#7fd8d0'];
+// Keyword-ish runs that must not be read letter by letter, or the `C` of
+// `Conjg(` would be coloured as the variable C.
+const LIB_SKIP = [...SCI_NAMES,'ClrMemory', 'ClrStat', 'WhileEnd', 'Conjg(', 'IfEnd', 'While', 'Break', 'Goto',
+  'Then', 'Else', 'Next', 'Step', 'Prog', 'Norm', 'Rnd(', 'Ran#', 'Rec(', 'Pol(', 'Abs(', 'NA', 'ε₀', 'σ',
+  'minX', 'maxX', 'Ans', 'Lbl', 'For', 'Fix', 'Sci', 'Deg', 'Rad', 'Gra', 'To', 'If',
+  'sin⁻¹(', 'cos⁻¹(', 'tan⁻¹(', 'sin(', 'cos(', 'tan(', 'log(', 'ln(', 'arg(', 'nCr', 'nPr'];
+
+// The tokens a keyboard cannot type. Everything NOT here has a plain-ASCII
+// spelling that normalize() understands (-> ~ / * sqrt( cbrt( cos-1( pi <= >=
+// <> ), so the bar only has to carry what is genuinely unreachable.
+// A plain string is both the label and what it types. A pair is [label, text],
+// where `|` marks where the caret should land and `@ASK` means "the next input
+// prompt", the same shortcut the calculator's own editor has: it looks at what
+// the program already asks for and gives you the next free variable.
+const LIB_KEYS = [
+  [['?→A:', '@ASK'], '→', '◢', ':', '²', '³', '⁻¹', '^(', '√(', '³√(', 'ˣ√(', 'ʳ', '°', 'π', 'i', '」', 'ᴇ'],
+  [['If…IfEnd', 'If |:Then :IfEnd:'], ['Else', ':Else '],
+    ['While…End', 'While |:WhileEnd:'], ['For…Next', 'For |1→A To 10:Next:'],
+    'Break', ['Lbl', 'Lbl 1:'], ['Goto', 'Goto 1'],
+    '⇒', '≠', '≥', '≤', 'Ans', 'Rnd(', 'Abs(', 'Prog '],
+];
+const LIB_ASK_VARS = ['A', 'B', 'C', 'D', 'X', 'Y', 'M'];
+const LIB_EDIT_VARS = [...LIB_ASK_VARS, 'Z'];
+const LIB_WORDS = [...LIB_SKIP, 'Σx²', 'Σx', 'σx', 'sx', 'x̄', 'sinh⁻¹(', 'cosh⁻¹(', 'tanh⁻¹(',
+  'sinh(', 'cosh(', 'tanh(', 'sqrt(', 'cbrt(', 'arcsin(', 'arccos(', 'arctan(',
+  'asin(', 'acos(', 'atan(', 'd/dx(', 'i', 'e', 'π'].sort((a,b)=>b.length-a.length);
+const libHistories = new Map();
+const libScientificWords = new Set(SCI_NAMES);
+function libWordAt(rest) {
+  return LIB_WORDS.find(w=>rest.startsWith(w) || (w.length>1 && !libScientificWords.has(w)
+    && !(['asin(','acos(','atan('].includes(w) && rest[0]==='A')
+    && rest.slice(0,w.length).toLowerCase()===w.toLowerCase()));
+}
+function libVariableSpans(src) {
+  const spans = [];
+  for (let i=0;i<src.length;) {
+    const rest = src.slice(i);
+    const number = /^(?:\d+\.?\d*|\.\d+)(?:[Eᴇ][+-]?\d+)?/.exec(rest);
+    const memory = /^M\s*[+−-](?=\s*(?::|◢|⇒|\n|$))/i.exec(rest);
+    const word = libWordAt(rest);
+    if (number || memory || word) { i += number ? number[0].length : memory ? memory[0].length : word.length; continue; }
+    const c = src[i], upper = c.toUpperCase();
+    if (LIB_EDIT_VARS.includes(upper) && (c === upper || !/[A-Za-z]/.test(src[i-1] || '') && !/[A-Za-z]/.test(src[i+1] || ''))) spans.push({start:i,end:i+1,variable:upper});
+    i++;
+  }
+  return spans;
+}
+function libTemporaryVariables(src) { return libVariableSpans(src).filter(v=>v.variable==='Z'); }
+function libSwapVariables(src, from, to, start=0, end=0) {
+  if (!LIB_EDIT_VARS.includes(from) || !LIB_EDIT_VARS.includes(to) || from===to || end<=start) return src;
+  const spans = libVariableSpans(src).filter(v=>v.start>=start && v.end<=end && (v.variable===from || v.variable===to));
+  let result='', at=0;
+  for (const v of spans) { result += src.slice(at,v.start)+(v.variable===from ? to : from); at=v.end; }
+  return result+src.slice(at);
+}
+
+
+/** The variable an `?→` button should offer: the first one the program does not
+ *  already ask for, so pressing it four times gives A, B, C, D. */
+function libNextAsk(src) {
+  const used = new Set([...String(src).matchAll(/\?\s*→\s*([A-DXYM])/g)].map(m => m[1]));
+  return LIB_ASK_VARS.find(v => !used.has(v)) || 'A';
+}
+
+const libState = { progs: [], sel: null, find: '', run: null, ctx: null, saveOk: true };
+const libFileHandles = new Map();
+
+function libAddExamples(progs, examples = LP_LITERAL_EXAMPLES) {
+  const ids = new Set(progs.map(p => p.id));
+  return progs.concat(examples.filter(p => !ids.has(p.id)).map(p => ({...p})));
+}
+
+// Skip calculator keywords and fixed memory keys; changing variable M must
+// never change the M+ operation into a fictitious A+ memory key.
+function libReplaceVariable(src, from, to) {
+  if (!LIB_ASK_VARS.includes(from) || !LIB_ASK_VARS.includes(to)) return src;
+  const spans = libVariableSpans(src).filter(v=>v.variable===from);
+  let result='', at=0;
+  for (const v of spans) { result += src.slice(at,v.start)+to; at=v.end; }
+  return result+src.slice(at);
+}
+
+function libSelectionBytes(src, start, end) {
+  if (end <= start) return null;
+  const fragment = src.slice(start,end);
+  // Selecting just the memory key still selects one key, without an operand.
+  if (/^\s*M\s*[+−-]\s*$/.test(fragment)) return 1;
+  return byteCount(fragment);
+}
+async function libSaveProgram(p, saveAs = false) {
+  if (!libSave()) return libMsg('瀏覽器儲存失敗；請另存新檔備份。');
+  const previous = libFileHandles.get(p.id);
+  if (!saveAs && !previous) return libMsg('已儲存此程式；重開同一網址可繼續，沒有新增 JSON。');
+  if (saveAs && typeof window.showSaveFilePicker !== 'function') {
+    return libDownload([p], `${p.name.replace(/[^\p{L}\p{N}_-]/gu,'_') || 'fx50-program'}.json`);
+  }
+  try {
+    const handle = saveAs ? await window.showSaveFilePicker({
+      suggestedName: `${p.name.replace(/[^\p{L}\p{N}_-]/gu,'_') || 'fx50-program'}.json`,
+      types: [{description:'Calculator program',accept:{'application/json':['.json']}}],
+    }) : previous;
+    const writable = await handle.createWritable();
+    await writable.write(JSON.stringify(makeProgramFile([p],p.id),null,2));
+    await writable.close();
+    libFileHandles.set(p.id,handle);
+    libMsg(`已儲存到 ${handle.name}；下次「儲存」會更新同一檔案。`);
+  } catch(e) {
+    libMsg(e.name === 'AbortError' ? '已取消另存；瀏覽器草稿仍已儲存。'
+      : '檔案未能更新；瀏覽器草稿已儲存，請另存新檔備份。');
+  }
+}
+
+const libEsc = s => String(s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+const libId = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+const libNow = () => new Date().toISOString().slice(0, 10);
+
+// ------------------------------------------------------------------ storage
+function libLoad() {
+  try {
+    const text = localStorage.getItem(LIB_KEY);
+    if (!text) return;
+    const raw = JSON.parse(text);
+    const adopted = libAdopt(raw);
+    if (!adopted) throw new Error('無法讀取程式簿');
+    libState.progs = adopted;
+    libState.sel = libState.progs.some(p => p.id === raw.selected)
+      ? raw.selected : (libState.progs[0] && libState.progs[0].id);
+  } catch (e) {
+    libState.saveOk = false;
+    libMsg('讀取舊資料失敗；請匯入你保存的 JSON。未有覆蓋舊資料。');
+  }
+}
+let libImportUndo = null;
+function libUpdateImportUndo() {
+  if (libImportUndo && libImportUndo.after !== JSON.stringify(libState.progs)) libImportUndo = null;
+  const button = document.getElementById('lundoimport'); if (button) button.hidden = !libImportUndo;
+}
+function libRememberImport(previous, selected) {
+  libImportUndo = { previous, selected, after: JSON.stringify(libState.progs) }; libUpdateImportUndo();
+}
+function libUndoImport() {
+  libUpdateImportUndo(); if (!libImportUndo) return;
+  const previous = libImportUndo; libImportUndo = null; libState.run = null;
+  libState.progs = previous.previous; libState.sel = previous.selected;
+  libSave(); libRender(); libMsg('已復原上次加入；原有程式及所選項目已恢復。');
+}
+function libSave() {
+  libUpdateImportUndo();
+  try {
+    const text = JSON.stringify(makeProgramFile(libState.progs, libState.sel));
+    localStorage.setItem(LIB_KEY, text);
+    libState.saveOk = localStorage.getItem(LIB_KEY) === text;
+  } catch (e) { libState.saveOk = false; }
+  libSaveStatus();
+  return libState.saveOk;
+}
+function libSaveStatus() {
+  const el = document.getElementById('lsave');
+  if (!el) return;
+  el.textContent = libState.saveOk
+    ? '已自動儲存在此瀏覽器；重開同一網址可繼續。另存 JSON 可備份／轉到 iPad。'
+    : '⚠ 自動儲存失敗！離開前請「另存 JSON」，否則會遺失今次修改。';
+  el.className = 'lsave' + (libState.saveOk ? '' : ' bad');
+}
+function libAdopt(data) {
+  try {
+    return readProgramRecords(data).map(p => ({ ...p, id: p.id || libId(),
+      updated: p.updated || libNow() })).filter(p => typeof p.src === 'string'
+        && (typeof (Array.isArray(data) ? data[0] : data.progs[0]) === 'object' || p.src.trim()));
+  } catch { return null; }
+}
+function libDownload(progs, filename) {
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(new Blob([
+    JSON.stringify(makeProgramFile(progs, libState.sel), null, 2)
+  ], { type: 'application/json' }));
+  a.download = filename;
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(a.href), 10000);
+  libMsg('已交給瀏覽器下載；請確認「下載項目／檔案」內有 JSON。未完成的草稿亦可再匯入編輯。');
+}
+
+// ------------------------------------------------------------- the text pane
+function libHighlight(src, comments=[]) {
+  let out = '', i = 0, next = 0;
+  const colour = {};
+  const variables = new Map(libVariableSpans(src).map(v=>[v.start,v]));
+  const activeComments = comments.filter(n=>!n.detached && n.end>n.start);
+  while (i < src.length) {
+    const rest = src.slice(i);
+    const kw = libWordAt(rest);
+    // Stop at every annotation boundary so its background follows the exact range.
+    const count = kw ? Math.min(kw.length,...activeComments.flatMap(n=>[n.start,n.end]).filter(p=>p>i).map(p=>p-i)) : 1;
+    const marked = activeComments.some(n=>n.start<=i && n.end>i);
+    const decorate = text => marked ? `<mark class="lcodecomment">${text}</mark>` : text;
+    if (kw) { out += decorate(`<i style="color:#8d96a3;font-style:normal">${libEsc(src.slice(i,i+count))}</i>`); i += count; continue; }
+    const c = src[i];
+    if (variables.has(i)) {
+      if (/→\s*$/.test(src.slice(0, i))) colour[c] = LIB_PALETTE[next++ % LIB_PALETTE.length];
+      out += decorate(c.toUpperCase()==='Z' ? `<span class="ltempvar" title="暫用 Z；真機沒有此變數">${c}</span>` : `<span style="color:${colour[c] || '#c8ced6'}">${c}</span>`);
+      i++; continue;
+    }
+    if (c === '◢' || c === '⇒' || c === ':') {
+      out += decorate(`<b style="color:#f2b134">${libEsc(c)}</b>`); i++; continue;
+    }
+    out += decorate(libEsc(c)); i++;
+  }
+  return out + '\n';
+}
+
+function libPaint() {
+  const ta = document.getElementById('lsrc'), hl = document.getElementById('lhl');
+  if (!ta || !hl) return;
+  hl.innerHTML = libHighlight(ta.value || '',libCur()?.comments || []);
+  hl.scrollTop = ta.scrollTop;
+  // Same gutter as the textarea, or the two layers wrap at different columns
+  // once a scrollbar appears and the caret stops lining up with the text.
+  hl.style.paddingRight = (10 + (ta.offsetWidth - ta.clientWidth)) + 'px';
+}
+
+// ------------------------------------------------------------------ the list
+const libCur = () => libState.progs.find(p => p.id === libState.sel) || null;
+
+function libBytes(p) {
+  try { return byteCount(p.src || ''); } catch (e) { return 0; }
+}
+
+function libStatus(p) {
+  if (!p.src.trim()) return { ok: null, msg: '仲未寫嘢' };
+  if (libTemporaryVariables(p.src).length) return {ok:false,msg:'暫用變數 Z 尚未換回：真機只有 A B C D X Y M'};
+  try { compile(p.src); return { ok: true, msg: '編譯到' }; }
+  catch (e) {
+    const at = typeof e.progPos === 'number' ? libWhere(normalize(p.src), e.progPos) : '';
+    return { ok: false, msg: (e.kind || e.message || '錯') + (at ? `（${at}）` : '') };
+  }
+}
+
+/** "第 2 行第 9 個字" from a character offset, so an error points somewhere. */
+function libWhere(src, pos) {
+  const upto = src.slice(0, Math.max(0, pos));
+  const line = upto.split('\n').length;
+  const col = pos - (upto.lastIndexOf('\n') + 1) + 1;
+  return `第 ${line} 行第 ${col} 個字`;
+}
+
+/** Describe both compile and runtime errors and map back to the editable source. */
+function libErrorDetail(src, e) {
+  const normalized = normalize(src);
+  const pos = Math.max(0, Math.min(normalized.length, e.progPos ?? e.pos ?? 0));
+  const start = normalized.lastIndexOf('\n', pos - 1) + 1;
+  const end = normalized.indexOf('\n', pos);
+  const line = normalized.slice(start, end < 0 ? normalized.length : end);
+  let rawPos = 0;
+  while (rawPos < src.length && normalize(src.slice(0, rawPos)).length < pos) rawPos++;
+  return { message: `${e.kind || e.message || '錯'}（${libWhere(normalized, pos)}）`,
+    excerpt: line + '\n' + ' '.repeat(pos - start) + '^', rawPos };
+}
+function libRunError(e) {
+  const r = libState.run;
+  const detail = libErrorDetail(r.src || '', e);
+  r.err = detail.message; r.errorDetail = detail; r.done = true; r.ask = null; r.busy = false;
+  libDrawRun();
+}
+
+function libRenderList() {
+  const box = document.getElementById('llist');
+  const find = libState.find.trim().toLowerCase();
+  const rows = libState.progs.filter(p => !find
+    || (p.name + ' ' + p.note + ' ' + p.src).toLowerCase().includes(find));
+  document.getElementById('lcount').textContent =
+    `${libState.progs.length} 條` + (find ? `，搵到 ${rows.length}` : '');
+  if (!rows.length) {
+    box.innerHTML = `<p class="lempty">${libState.progs.length
+      ? '搵唔到。' : '仲未有程式。撳「+ 新增」開始，或者「匯入」拎返個檔案入嚟。'}</p>`;
+    return;
+  }
+  box.innerHTML = rows.map(p => {
+    const st = libStatus(p);
+    const dot = st.ok === false ? '<i class="bad"></i>' : st.ok ? '<i class="good"></i>' : '<i></i>';
+    return `<button class="lrow${p.id === libState.sel ? ' on' : ''}" data-id="${libEsc(p.id)}">
+      ${dot}<span class="nm">${libEsc(p.name || '未命名')}</span>
+      <span class="meta">${p.status === 'complete' ? '完成' : '草稿'} · ${p.mode} · ${libBytes(p)} B</span></button>`;
+  }).join('');
+  box.querySelectorAll('.lrow').forEach(b => {
+    b.onclick = () => { libState.sel = b.dataset.id; libState.run = null; libSave(); libRender(); };
+  });
+}
+
+function libRenderDetail() {
+  const p = libCur();
+  const pane = document.getElementById('ldetail');
+  if (!p) {
+    pane.innerHTML = '<p class="lempty">左邊揀一條，或者撳「+ 新增」。</p>';
+    return;
+  }
+  const st = libStatus(p), b = libBytes(p);
+  pane.innerHTML = `
+    <div class="lhead">
+      <input id="lname" value="${libEsc(p.name)}" placeholder="程式名，例：二次方程">
+      <label>狀態 <select id="lstatus"><option value="draft" ${p.status !== 'complete' ? 'selected' : ''}>草稿</option><option value="complete" ${p.status === 'complete' ? 'selected' : ''}>完成</option></select></label>
+      <label>試行角度 <select id="langle">${['deg', 'rad', 'gra'].map(a => `<option value="${a}" ${p.angle === a ? 'selected' : ''}>${a.toUpperCase()}</option>`).join('')}</select></label>
+      <span class="lmodes">${LIB_MODES.map(m =>
+        `<button data-m="${m}" class="${m === p.mode ? 'on' : ''}">${m}</button>`).join('')}</span>
+      <button class="ldel" id="ldel">刪除</button>
+    </div>
+    <details class="lguide" ${p.guide ? 'open' : ''}>
+      <summary>教學說明 · 輸入／輸出／例題</summary>
+      <p>寫低怎樣輸入、會顯示甚麼，再用一題已知答案核對。修改程式後請一併更新說明。</p>
+      ${[['inputs','輸入次序'],['outputs','輸出次序'],['example','例題與預期答案'],['caution','設定與限制']].map(([field,label]) => `<label>${label}<textarea id="lguide-${field}" aria-label="${label}" rows="2">${libEsc(p.guide?.[field] || '')}</textarea></label>`).join('')}
+    </details>
+    <div class="lkeys">${LIB_KEYS.map(row =>
+      `<div class="lkrow">${row.map(k => {
+        const [label, text] = Array.isArray(k) ? k : [k.trim(), k];
+        return `<button data-k="${libEsc(text)}">${libEsc(label)}</button>`;
+      }).join('')}</div>`).join('')}</div>
+    <div class="ledittools">
+      <label>科學常數 <select id="lscience"><option value="">選擇常數</option>${SCI_CONSTANTS.map(([symbol],i)=>`<option value="${sciToken(symbol)}">${String(i+1).padStart(2,"0")} · ${symbol === "e" ? "qₑ（基本電荷）" : symbol}</option>`).join('')}</select></label>
+      <button id="lundo" title="⌘Z / Ctrl+Z">復原 Undo</button><button id="lredo" title="⇧⌘Z / Ctrl+Shift+Z">重做 Redo</button>
+      <span id="lselection" role="status">選取程式碼以計算 bytes</span>
+      <label>互換 <select id="lreplacefrom">${LIB_EDIT_VARS.map(v=>`<option>${v}</option>`).join('')}</select></label>
+      <span>↔</span><select id="lreplaceto" aria-label="與此變數互換">${LIB_EDIT_VARS.map(v=>`<option>${v}</option>`).join('')}</select>
+      <button id="lreplace">互換選取範圍</button>
+      <button id="lcommentadd">＋ 段落註解</button>
+    </div>
+    <div class="leditgrid"><div class="lwrap"><pre id="lhl"></pre><textarea id="lsrc" spellcheck="false"
+      autocapitalize="off" autocorrect="off"
+      placeholder="?→A:?→B:&#10;普通鍵盤打就得：-> → ／ ~ ◢ ／ / ÷ ／ * × ／ sqrt( √( ／ cos-1( cos⁻¹( ／ pi π&#10;打唔到嘅撳上面條掣。減號自己分長短，唔使理。"
+      >${libEsc(p.src)}</textarea></div>
+      <aside class="lcomments"><b>段落註解</b><p class="lhint">選取程式碼 → ＋ 段落註解。註解不執行、不計 bytes。</p><div id="lcomments"></div>
+      ${p.remarks ? `<details class="llegacy"><summary>舊整份備註（保留）</summary><textarea id="lremarks" spellcheck="false">${libEsc(p.remarks)}</textarea></details>` : ''}
+      </aside></div>
+      <div id="ltempwarning" class="ltempwarning" role="status"></div>
+    <div class="lbar">
+      <span class="lb"><b>${b}</b> bytes　${b > TOTAL_BYTES
+        ? `<em class="bad">超出機嘅 ${TOTAL_BYTES}</em>` : `／機得 ${TOTAL_BYTES}`}</span>
+      <span class="lb ${st.ok === false ? 'bad' : st.ok ? 'good' : ''}">${libEsc(st.msg)}</span>
+      <span class="grow"></span>
+      <button id="lsaveprogram" class="sec">儲存</button>
+      <button id="lsingle" class="sec">另存新檔 JSON</button>
+      <button id="lopen" class="sec">載入 50FH</button>
+      <button id="lcopy" class="sec">複製程式</button>
+      <button id="lrun">▶ 行一次</button>
+    </div>
+    <label class="lnote">點用（輸入次序、例題、幾時用）
+      <textarea id="lnote" spellcheck="false" placeholder="例：A 係二次項系數，B 一次項，C 常數。撳 EXE 逐個睇：判別式 → 頂點 x → 頂點 y → 兩個根。">${libEsc(p.note)}</textarea></label>
+    <div id="lout" class="lout"></div>
+    <p class="lstamp">最後改過：${libEsc(p.updated || '')}</p>`;
+
+  const ta = document.getElementById('lsrc');
+  ta.value=p.src;
+  document.getElementById('lscience').onchange = e => {
+    const token = e.target.value; if (!token) return;
+    const a = ta.selectionStart, b = ta.selectionEnd;
+    ta.onbeforeinput?.();
+    ta.value = ta.value.slice(0,a)+token+ta.value.slice(b);
+    ta.selectionStart = ta.selectionEnd = a+token.length;
+    e.target.value = ''; ta.focus(); ta.oninput();
+  };
+  const selectionUpdate = () => {
+    try {
+      const n = libSelectionBytes(ta.value,ta.selectionStart,ta.selectionEnd);
+      document.getElementById('lselection').textContent = n === null
+        ? '選取程式碼以計算 bytes' : `選取：${n} bytes`;
+    } catch { document.getElementById('lselection').textContent = '選取內容暫時無法計數'; }
+  };
+  for (const event of ['select','keyup','mouseup','touchend']) ta.addEventListener(event,selectionUpdate);
+  ta.onselect = selectionUpdate;
+  document.getElementById('lreplacefrom').value = 'A';
+  document.getElementById('lreplaceto').value = 'B';
+  const history = libHistories.get(p.id) || createEditorHistory(editorSnapshot(p.src,p.comments || []));
+  libHistories.set(p.id,history);
+  const rememberCursor = () => {
+    history.entries[history.at].start=ta.selectionStart;
+    history.entries[history.at].end=ta.selectionEnd;
+  };
+  ta.onbeforeinput = rememberCursor;
+  const updateHistoryButtons = () => {
+    document.getElementById('lundo').disabled = history.at===0;
+    document.getElementById('lredo').disabled = history.at===history.entries.length-1;
+  };
+  const renderComments = () => {
+    const notes = p.comments || [];
+    document.getElementById('lcomments').innerHTML = notes.length ? notes.map((n,i)=>`
+      <article class="lcomment${n.detached ? ' detached' : ''}">
+        <div class="lcommenthead"><button id="lcjump-${i}" ${n.detached ? 'disabled' : ''}>${n.detached ? '原段已刪除' : `${libWhere(p.src,n.start)} 起`}</button>
+        <button id="lcdel-${i}" aria-label="刪除此段註解">刪除註解</button></div>
+        <pre>${libEsc(n.quote || p.src.slice(n.start,n.end))}</pre>
+        <textarea id="lctext-${i}" spellcheck="false" aria-label="此段註解" placeholder="這段用途、原理或注意事項…">${libEsc(n.text)}</textarea>
+      </article>`).join('') : '<p class="lhint">未有段落註解。</p>';
+    notes.forEach((n,i)=>{
+      const input=document.getElementById(`lctext-${i}`);
+      input.value=n.text;
+      input.oninput=()=>{
+        rememberCursor(); n.text=input.value;
+        editorRemember(history,editorSnapshot(p.src,p.comments,ta.selectionStart,ta.selectionEnd));
+        p.updated=libNow(); libSave(); updateHistoryButtons();
+      };
+      input.onkeydown=historyKey;
+      document.getElementById(`lcjump-${i}`).onclick=()=>{
+        if(n.detached) return;
+        ta.focus(); ta.selectionStart=n.start; ta.selectionEnd=n.end;
+        // Bring the anchor into view without moving or changing the code.
+        ta.scrollTop=Math.max(0,(p.src.slice(0,n.start).split('\n').length-3)*23);
+        libPaint(); selectionUpdate();
+      };
+      document.getElementById(`lcdel-${i}`).onclick=()=>{
+        rememberCursor(); p.comments=p.comments.filter(x=>x.id!==n.id);
+        editorRemember(history,editorSnapshot(p.src,p.comments,ta.selectionStart,ta.selectionEnd));
+        p.updated=libNow(); refreshEditor();
+      };
+    });
+  };
+  const refreshEditor = (drawComments=true) => {
+    p.updated=libNow(); libState.run=null; libDrawRun();
+    libPaint(); selectionUpdate(); libSave(); libRenderList(); updateHistoryButtons();
+    if(drawComments) renderComments();
+    const temporary=libTemporaryVariables(p.src);
+    document.getElementById('ltempwarning').textContent=temporary.length
+      ? `暫用 Z：${temporary.length} 處。真機只有 A B C D X Y M；換回合法變數後才可執行或送到計數機。` : '';
+    const nb=libBytes(p), nst=libStatus(p), bars=pane.querySelectorAll('.lbar .lb');
+    if(bars[0]) bars[0].innerHTML=`<b>${nb}</b> bytes　${nb>TOTAL_BYTES ? `<em class="bad">超出機嘅 ${TOTAL_BYTES}</em>` : `／機得 ${TOTAL_BYTES}`}`;
+    if(bars[1]) { bars[1].className='lb '+(nst.ok===false ? 'bad' : nst.ok ? 'good' : ''); bars[1].textContent=nst.msg; }
+  };
+  const moveHistory = (direction,focusTarget) => {
+    const commentIndex=/^lctext-(\d+)$/.exec(focusTarget?.id || '');
+    const focusNote=commentIndex ? p.comments?.[Number(commentIndex[1])]?.id : null;
+    const focusStart=focusTarget?.selectionStart;
+    rememberCursor(); const snapshot=editorMove(history,direction); if(!snapshot) return;
+    p.src=ta.value=snapshot.src; p.comments=snapshot.comments; p.status='draft';
+    document.getElementById('lstatus').value='draft';
+    ta.focus(); ta.selectionStart=snapshot.start; ta.selectionEnd=snapshot.end;
+    refreshEditor();
+    const restoredIndex=focusNote ? (p.comments || []).findIndex(n=>n.id===focusNote) : -1;
+    if(restoredIndex>=0) { const input=document.getElementById(`lctext-${restoredIndex}`); input.focus(); input.selectionStart=input.selectionEnd=Math.min(focusStart || 0,input.value.length); }
+  };
+  function historyKey(e) {
+    if(!e.isComposing && (e.metaKey || e.ctrlKey) && e.key.toLowerCase()==='z') {
+      e.preventDefault(); moveHistory(e.shiftKey ? 1 : -1,e.target);
+    }
+  }
+  ta.onkeydown=historyKey;
+  document.getElementById('lundo').onclick=()=>moveHistory(-1);
+  document.getElementById('lredo').onclick=()=>moveHistory(1);
+  document.getElementById('lreplace').onclick = () => {
+    const from=document.getElementById('lreplacefrom').value, to=document.getElementById('lreplaceto').value;
+    const a=ta.selectionStart,b=ta.selectionEnd;
+    if(b<=a) return libMsg('先選取要互換的程式碼；全選即可處理整份。');
+    if(from===to) return;
+    rememberCursor(); ta.value=libSwapVariables(ta.value,from,to,a,b);
+    ta.selectionStart=a; ta.selectionEnd=b; ta.oninput({preserveAnchors:true}); ta.focus();
+  };
+  document.getElementById('lcommentadd').onclick=()=>{
+    const a=ta.selectionStart,b=ta.selectionEnd;
+    if(b<=a) return libMsg('先選取要加註解的程式碼。');
+    rememberCursor(); p.comments=p.comments || [];
+    p.comments.push({id:libId(),start:a,end:b,quote:p.src.slice(a,b),text:''});
+    editorRemember(history,editorSnapshot(p.src,p.comments,a,b)); refreshEditor();
+    document.getElementById(`lctext-${p.comments.length-1}`).focus();
+  };
+  ta.oninput = event => {
+    p.comments=event?.preserveAnchors ? (p.comments || []).map(n=>n.detached ? {...n} : {...n,quote:ta.value.slice(n.start,n.end)}) : editorReanchor(p.comments || [],p.src,ta.value);
+    p.src=ta.value; p.status='draft'; document.getElementById('lstatus').value='draft';
+    editorRemember(history,editorSnapshot(p.src,p.comments,ta.selectionStart,ta.selectionEnd));
+    refreshEditor();
+  };
+  updateHistoryButtons(); renderComments();
+  document.getElementById('ltempwarning').textContent=libTemporaryVariables(p.src).length
+    ? '暫用 Z 尚未換回；真機不可執行。' : '';
+  ta.addEventListener('scroll', () => {
+    const hl = document.getElementById('lhl'); if (hl) hl.scrollTop = ta.scrollTop;
+  });
+  document.getElementById('lstatus').onchange = e => {
+    p.status = e.target.value; p.updated = libNow(); libSave(); libRenderList();
+  };
+  document.getElementById('langle').onchange = e => {
+    p.angle = e.target.value; p.updated = libNow(); p.status = 'draft'; libState.run = null;
+    libSave(); libRender();
+  };
+  for (const field of ['inputs','outputs','example','caution']) document.getElementById(`lguide-${field}`).oninput = e => {
+    p.guide = {...(p.guide || {}), [field]:e.target.value}; p.updated = libNow(); libSave();
+  };
+  document.getElementById('lsaveprogram').onclick = () => libSaveProgram(p);
+  document.getElementById('lsingle').onclick = () => libSaveProgram(p,true);
+  if(p.remarks) document.getElementById('lremarks').oninput = e => {
+    p.remarks = e.target.value; p.updated = libNow(); libSave();
+  };
+  document.getElementById('lopen').onclick = () => {
+    if(libTemporaryVariables(p.src).length) return libMsg('暫用 Z 尚未換回；請先改回合法變數。');
+    if (!p.src.trim()) return libMsg('先寫一條程式。草稿可以儲存；載入時會檢查格式及容量。');
+    try {
+      sessionStorage.setItem('fx50.pending-program', JSON.stringify(makeProgramFile([p])));
+      location.href = new URL((location.pathname || '').endsWith('/library.html') ? 'dist/fx-50FH-II.html' : 'fx-50FH-II.html', location.href).href;
+    } catch { libMsg('此瀏覽器無法傳送；請另存此程式 JSON，然後在計數機 MODE 6 匯入。'); }
+  };
+  document.getElementById('lname').oninput = e => {
+    p.name = e.target.value; p.updated = libNow(); libSave(); libRenderList();
+  };
+  document.getElementById('lnote').oninput = e => {
+    p.note = e.target.value; p.updated = libNow(); libSave();
+  };
+  pane.querySelectorAll('.lmodes button').forEach(btn => {
+    btn.onclick = () => { p.mode = btn.dataset.m; p.status = 'draft'; p.updated = libNow(); libSave(); libRender(); };
+  });
+  document.getElementById('ldel').onclick = ev => {
+    const btn = ev.currentTarget;
+    if (btn.dataset.armed !== '1') {
+      btn.dataset.armed = '1'; btn.textContent = '再撳一次 = 刪走';
+      setTimeout(() => { btn.dataset.armed = ''; btn.textContent = '刪除'; }, 4000);
+      return;
+    }
+    libState.progs = libState.progs.filter(x => x.id !== p.id);
+    libState.sel = null; libState.run = null; libSave(); libRender();
+  };
+  document.getElementById('lcopy').onclick = async ev => {
+    try { await navigator.clipboard.writeText(normalize(p.src)); ev.currentTarget.textContent = '複製咗'; }
+    catch (e) { ev.currentTarget.textContent = '複製唔到'; }
+    setTimeout(() => { const b2 = document.getElementById('lcopy'); if (b2) b2.textContent = '複製程式'; }, 2500);
+  };
+  pane.querySelectorAll('.lkeys button').forEach(btn => {
+    btn.onclick = () => {
+      let k = btn.dataset.k, caret = -1;
+      if (k === '@ASK') k = `?→${libNextAsk(ta.value)}:`;
+      if (k.includes('|')) { caret = k.indexOf('|'); k = k.replace('|', ''); }
+      const a = ta.selectionStart, z = ta.selectionEnd;
+      ta.onbeforeinput?.();
+      ta.value = ta.value.slice(0, a) + k + ta.value.slice(z);
+      const at = a + (caret < 0 ? k.length : caret);
+      ta.selectionStart = ta.selectionEnd = at;
+      ta.focus();
+      ta.oninput();
+    };
+  });
+  document.getElementById('lrun').onclick = () => libStart(p);
+  libPaint();
+  libDrawRun();
+}
+
+// --------------------------------------------------------------- running one
+// The engine hands back a generator that stops at every `?` and every `◢`, the
+// same one the calculator itself steps through — so what shows here is what the
+// machine would show, not a second implementation of the same program.
+function libStart(p) {
+  if(libTemporaryVariables(p.src).length) return libMsg('暫用 Z 尚未換回；真機只有 A B C D X Y M。草稿已保留。');
+  if (!['COMP', 'CMPLX', 'SD', 'REG'].includes(p.mode)) return libMsg(`${p.mode} 模式尚未支援試行；草稿仍可保存。`);
+  libState.ctx = new Ctx({ mode: p.mode, angle: p.angle || 'deg' });
+  libState.run = { src: p.src, lines: [], gen: null, ask: null, done: false, err: '' };
+  try {
+    libState.run.gen = run(compile(p.src), libState.ctx, { tick: LIB_TICK });
+    libDrawRun(); libStep();
+  } catch (e) {
+    libRunError(e);
+  }
+}
+
+function libStep(value) {
+  const r = libState.run;
+  let step;
+  try { step = r.gen.next(value); }
+  catch (e) { return libRunError(e); }
+  if (step.done) {
+    // The machine does not blank the line when a program finishes: the last
+    // statement it executed stays up with its value (SPEC §8e). Skip it only
+    // when the program ended on a ◢ and it is already the row above.
+    const last = libState.ctx.lastStmt || '';
+    const end = fmtResult(libState.ctx.vars.Ans, libState.ctx, { noFrac: true });
+    const val = end.text2 ? `${end.text}  +  ${end.text2}i` : end.text;
+    const prev = r.lines[r.lines.length - 1];
+    if (last && !(prev && prev.src === last && prev.val === val)) r.lines.push({ src: last, val });
+    r.done = true; r.ask = null; return libDrawRun();
+  }
+  // A slice boundary, not an output: hand the event loop back and carry on, so
+  // a program that loops for ever (Nixon writes those) does not freeze the page
+  // and the stop button still answers.
+  if (step.value.type === 'tick') {
+    if (!r.busy) { r.busy = true; libDrawRun(); }
+    r.slice = setTimeout(() => {
+      if (!libState.run || libState.run !== r || r.done) return;
+      r.slice = null; libStep();
+    }, 0);
+    return;
+  }
+  r.busy = false;
+  if (step.value.type === 'input') { r.ask = step.value.name; return libDrawRun(); }
+  const shown = fmtResult(step.value.value, libState.ctx, { noFrac: true });
+  r.lines.push({ src: step.value.text || '', val: shown.text2
+    ? `${shown.text}  +  ${shown.text2}i` : shown.text });
+  r.ask = null;
+  libDrawRun();
+}
+
+function libDrawRun() {
+  const box = document.getElementById('lout');
+  if (!box) return;
+  const r = libState.run;
+  if (!r) { box.innerHTML = ''; return; }
+  const rows = r.lines.map(l =>
+    `<div class="lo"><span class="lsrc">${libEsc(l.src)}</span><b>${libEsc(l.val)}</b></div>`).join('');
+  const tail = r.err ? `<div class="lo err">${libEsc(r.err)}</div><pre class="lerrorcode">${libEsc(r.errorDetail?.excerpt || '')}</pre><button id="lerrorjump" class="sec">跳到出錯位置</button>`
+    : r.ask ? `<div class="lo ask"><span class="lsrc">${libEsc(r.ask)}?</span>
+        <input id="lask" placeholder="打個數，Enter" autocapitalize="off" autocorrect="off"></div>`
+    : r.done ? '<div class="lo fin">— 行完 —</div>' : '';
+  box.innerHTML = `<div class="lohead">行嘅結果 <button id="lstop" class="sec">停止</button></div>${rows}${tail}`
+    + (!r.done && !r.ask && !r.busy ? '<button id="lnext" class="sec">繼續（EXE）</button>' : '');
+  document.getElementById('lstop').onclick = () => { libState.run = null; libDrawRun(); };
+  const jump = document.getElementById('lerrorjump');
+  if (jump) jump.onclick = () => {
+    const editor = document.getElementById('lsrc');
+    const pos = r.errorDetail.rawPos;
+    editor.focus(); editor.setSelectionRange(pos, Math.min(editor.value.length, pos + 1));
+  };
+  const ask = document.getElementById('lask');
+  if (ask) {
+    ask.focus();
+    ask.onkeydown = ev => {
+      if (ev.key !== 'Enter') return;
+      const raw = ask.value.trim();
+      let v;
+      try {
+        v = raw === '' ? libState.ctx.vars[r.ask]
+          : calc(raw, new Ctx({ mode: libState.ctx.mode, angle: libState.ctx.angle })).value;
+      } catch (e) { ask.value = ''; ask.placeholder = '呢個數打錯咗'; return; }
+      r.lines.push({ src: r.ask + '?', val: raw === '' ? '（照舊）' : raw });
+      libStep(v);
+    };
+  }
+  const next = document.getElementById('lnext');
+  if (next) next.onclick = () => libStep();
+}
+
+// ------------------------------------------------------------------- the page
+const LIB_CSS = `
+.lguide{margin:10px 0;padding:12px;border:1px solid #445469;border-radius:9px;color:#cbd6e6}.lguide summary{font-weight:700;cursor:pointer}.lguide p{font-size:12px;line-height:1.5}.lguide label{display:block;margin-top:9px;font-size:12px}.lguide textarea{display:block;box-sizing:border-box;width:100%;margin-top:4px;padding:8px;background:#181d25;color:#edf2fa;border:1px solid #49586a;border-radius:5px;font:inherit;font-size:13px;line-height:1.5;resize:vertical}
+button:focus-visible,a:focus-visible,textarea:focus-visible,input:focus-visible,select:focus-visible{outline:3px solid #579dff;outline-offset:2px}
+
+*{box-sizing:border-box}
+body{margin:0;background:#171a1f;color:#e8ecf1;
+ font:15px/1.6 "PingFang HK","Hiragino Sans TC","Microsoft JhengHei",-apple-system,system-ui,sans-serif}
+.lapp{display:flex;flex-direction:column;height:100vh;height:100dvh}
+.ltop{display:flex;align-items:center;gap:10px;padding:10px 14px;border-bottom:1px solid #2b313a;flex-wrap:wrap}
+.ltop a{color:#a9c7ef}
+.lsave{padding:8px 14px;font-size:12px;color:#8fd694;border-bottom:1px solid #2b313a}
+.lsave.bad{color:#ffbf80}
+.lhead select{background:#262c34;color:#fff;padding:5px;border:1px solid #454d59}
+.ltop h1{margin:0;font-size:16px;font-weight:700;letter-spacing:.3px}
+.ltop .ver{font:11px/1 ui-monospace,Menlo,monospace;color:#6c7480}
+.ltop .grow{flex:1}
+#lfind{background:#1f242b;border:1px solid #39404b;color:#e8ecf1;border-radius:8px;
+ padding:6px 10px;font:13px inherit;min-width:150px}
+.ltop button{background:#333a44;border:1px solid #454d59;color:#dfe4ea;border-radius:8px;
+ padding:6px 12px;font:13px inherit;cursor:pointer}
+.ltop button.go{background:#3d8b5f;border-color:#3d8b5f;color:#fff}
+.lbody{flex:1;display:flex;min-height:0}
+.lbody.sidebar-hidden .lside{display:none}
+.ledittools{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin:8px 0;color:#aab4c2;font-size:12px}
+.ledittools select,.ledittools button{background:#262c34;color:#fff;border:1px solid #454d59;padding:5px;border-radius:5px}
+.leditgrid{display:grid;grid-template-columns:minmax(0,1fr) 280px;gap:12px}
+.lcomments{min-width:0;font-size:12px;color:#aab4c2}
+.lhint{font-size:12px;color:#929dab;line-height:1.6;margin:6px 0}
+.lcomment{border:1px solid #454d59;border-radius:8px;padding:8px;margin:8px 0;background:#20252c}
+.lcommenthead{display:flex;gap:6px;justify-content:space-between}
+.lcomment button{border:0;background:#333a44;color:#cdd5df;border-radius:4px;padding:4px;font:11px inherit;cursor:pointer}
+.lcomment button:disabled{opacity:.6;cursor:default}
+.lcomment pre{white-space:pre-wrap;word-break:break-all;color:#d9bd78;font:11px/1.5 monospace;max-height:100px;overflow:auto;margin:6px 0}
+.lcomment textarea,.llegacy textarea{display:block;width:100%;min-height:70px;background:#171b21;color:#dfe4ea;border:1px solid #454d59;border-radius:5px;padding:7px;font:inherit;font-size:13px;line-height:1.5;resize:vertical}
+.llegacy{margin-top:12px;color:#8d96a3}
+.ltempwarning{color:#ffb09b;font-size:12px;margin-top:8px}
+.ltempwarning:empty{display:none}
+.ltempvar{color:#ffb09b;text-decoration:underline dotted #ff8976;text-underline-offset:3px}
+.lcodecomment{color:inherit;background:#5b4e2b66;border-radius:0;padding:0}
+.ledittools button:disabled{opacity:.4;cursor:default}
+.lremarks{display:flex;flex-direction:column;font-size:12px;color:#aab4c2;gap:6px}
+.lremarks textarea{flex:1;min-height:200px;width:100%;background:#1b1f25;color:#dfe4ea;border:1px solid #39404b;border-radius:10px;padding:10px;resize:vertical;font:13px/1.7 monospace}
+.lside{width:270px;flex:none;border-right:1px solid #2b313a;display:flex;flex-direction:column;min-height:0}
+#lcount{padding:8px 12px;font:12px inherit;color:#8d96a3;border-bottom:1px solid #2b313a}
+#llist{flex:1;overflow:auto;padding:6px}
+.lrow{display:flex;align-items:center;gap:7px;width:100%;text-align:left;background:none;border:0;
+ color:#dfe4ea;padding:7px 8px;border-radius:8px;cursor:pointer;font:13px inherit}
+.lrow:hover{background:#20252c}
+.lrow.on{background:#2b323c}
+.lrow .nm{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.lrow .meta{font:11px ui-monospace,Menlo,monospace;color:#7d8794;flex:none}
+.lrow i{width:7px;height:7px;border-radius:50%;background:#454d59;flex:none}
+.lrow i.good{background:#3d8b5f}
+.lrow i.bad{background:#c0504d}
+#ldetail{flex:1;overflow:auto;padding:14px 16px;min-width:0}
+.lempty{color:#7d8794;font-size:13.5px;padding:18px;text-align:center}
+.lhead{display:flex;gap:8px;align-items:center;margin-bottom:10px;flex-wrap:wrap}
+#lname{flex:1;min-width:160px;background:#1f242b;border:1px solid #39404b;color:#fff;
+ border-radius:8px;padding:7px 10px;font:600 15px inherit}
+.lmodes{display:flex;gap:4px}
+.lmodes button{background:#262c34;border:1px solid #39404b;color:#9aa2ad;border-radius:7px;
+ padding:5px 9px;font:12px ui-monospace,Menlo,monospace;cursor:pointer}
+.lmodes button.on{background:#4a5563;color:#fff;border-color:#6d7887}
+.ldel{background:#3a2226;border:1px solid #5b3036;color:#e79a9a;border-radius:7px;
+ padding:5px 10px;font:12px inherit;cursor:pointer}
+.lkeys{display:flex;flex-direction:column;gap:4px;margin-bottom:7px}
+.lkrow{display:flex;flex-wrap:wrap;gap:4px}
+.lkeys button{background:#262c34;border:1px solid #39404b;color:#cfd5dd;border-radius:6px;
+ padding:3px 8px;font:12px/1.3 "SF Mono",Menlo,Consolas,monospace;cursor:pointer}
+.lkeys button:hover{background:#3a424d;color:#fff}
+.lwrap{position:relative;background:#1b1f25;border:1px solid #39404b;border-radius:10px;overflow:hidden}
+.lwrap:focus-within{outline:1px solid #f2b134}
+#lhl,#lsrc{margin:0;padding:10px;font:13.5px/1.7 "SF Mono",Menlo,Consolas,monospace;
+ white-space:pre-wrap;word-break:break-all;border:0}
+#lhl{position:absolute;inset:0;color:#c8ced6;pointer-events:none;overflow:hidden}
+#lsrc{position:relative;display:block;width:100%;height:200px;background:transparent;
+ color:transparent;caret-color:#f2b134;resize:vertical;outline:none}
+#lsrc::placeholder{color:#5d656f}
+.lbar{display:flex;align-items:center;gap:12px;margin:9px 0 4px;flex-wrap:wrap}
+.lbar .grow{flex:1}
+.lb{font:12px inherit;color:#9aa2ad}
+.lb b{color:#f2b134}
+.lb.good{color:#7cc59b}
+.lb.bad,.lb em.bad{color:#e79a9a;font-style:normal}
+.lbar button{background:#3d8b5f;border:0;color:#fff;border-radius:8px;padding:7px 14px;
+ font:600 13px inherit;cursor:pointer}
+.lbar button.sec{background:#3a424d}
+.lnote{display:block;margin-top:12px;font:12px inherit;color:#8d96a3}
+.lerrorcode{white-space:pre;overflow:auto;font-family:monospace;color:#ffb3b3}
+.lnote textarea{display:block;width:100%;height:72px;margin-top:5px;background:#1b1f25;
+ border:1px solid #39404b;color:#dfe4ea;border-radius:10px;padding:9px 10px;
+ font:13px/1.6 inherit;resize:vertical;outline:none}
+.lnote textarea:focus{outline:1px solid #f2b134}
+.lout{margin-top:14px}
+.lout:empty{display:none}
+.lohead{font:12px inherit;color:#8d96a3;margin-bottom:6px}
+.lo{display:flex;align-items:center;gap:10px;padding:6px 10px;border-radius:8px;background:#1b1f25;
+ margin-bottom:4px;font:13px/1.5 "SF Mono",Menlo,Consolas,monospace}
+.lo .lsrc{flex:1;color:#8d96a3;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.lo b{color:#f2b134;font-size:15px}
+.lo.ask{background:#232a33}
+.lo.ask input{flex:1;background:#171a1f;border:1px solid #454d59;color:#fff;border-radius:6px;
+ padding:5px 8px;font:13px inherit;outline:none}
+.lo.err{color:#e79a9a;background:#2e2023}
+.lo.fin{color:#7d8794;justify-content:center}
+#lnext{background:#3a424d;border:0;color:#dfe4ea;border-radius:8px;padding:6px 12px;
+ font:13px inherit;cursor:pointer}
+.lstamp{color:#6c7480;font-size:11.5px;margin:14px 0 0}
+.lmsg{padding:6px 14px;font:12.5px inherit;color:#7cc59b;border-top:1px solid #2b313a}
+@media (max-width:760px){
+  .leditgrid{grid-template-columns:minmax(0,1fr)}
+  .lcomments{max-height:35vh;overflow:auto}
+  .lbody{flex-direction:column}
+  .lside{width:auto;max-height:34vh;border-right:0;border-bottom:1px solid #2b313a}
+}`;
+
+function libRender() { libRenderList(); libRenderDetail(); }
+
+function libMsg(text) {
+  const el = document.getElementById('lmsg');
+  el.textContent = text;
+  setTimeout(() => { if (el.textContent === text) el.textContent = ''; }, 5000);
+}
+
+function locationPathForCalc() {
+  return typeof location !== 'undefined' && (location.pathname || '').endsWith('/library.html') ? 'dist/fx-50FH-II.html' : 'fx-50FH-II.html';
+}
+
+function libBoot() {
+  const style = document.createElement('style');
+  style.textContent = LIB_CSS;
+  document.head.appendChild(style);
+  const app = document.getElementById('app') || document.body;
+  app.innerHTML = `<div class="lapp">
+    <div class="ltop">
+      <button id="lsidetoggle" aria-expanded="true">收起程式列表</button>
+      <h1>50FH Program Code Book · 程式簿</h1><a href="${locationPathForCalc()}">計數機</a><a href="lp-n.html">LP · N 條約束</a><span class="ver">v${VERSION}</span>
+      <span class="grow"></span>
+      <input id="lfind" placeholder="搵…（名、用法、程式內容）">
+      <button id="lnew" class="go">+ 新增</button>
+      <button id="lteach">加入四個教學範例</button>
+      <button id="lliteral">LP 原句版</button>
+      <button id="lexp">另存全部 JSON</button>
+      <button id="lcopyall">複製全部</button>
+      <button id="limp">匯入檔案</button><button id="lundoimport" hidden>復原上次加入</button>
+      <input type="file" id="lfile" accept=".json,application/json" hidden>
+    </div>
+    <div id="lsave" class="lsave" role="status"></div>
+    <div class="lbody" id="lbody">
+      <div class="lside"><div id="lcount"></div><div id="llist"></div></div>
+      <div id="ldetail"></div>
+    </div>
+    <div class="lmsg" id="lmsg"></div>
+  </div>`;
+
+  const toggleSidebar = hidden => {
+    document.getElementById('lbody').classList.toggle('sidebar-hidden',hidden);
+    const button = document.getElementById('lsidetoggle');
+    button.textContent = hidden ? '顯示程式列表' : '收起程式列表';
+    button.setAttribute?.('aria-expanded',String(!hidden));
+    libPaint();
+  };
+  try { toggleSidebar(localStorage.getItem('fx50.library.sidebar') === 'hidden'); } catch {}
+  document.getElementById('lsidetoggle').onclick = () => {
+    const hidden = !document.getElementById('lbody').classList.contains('sidebar-hidden');
+    toggleSidebar(hidden);
+    try { localStorage.setItem('fx50.library.sidebar',hidden ? 'hidden' : 'shown'); } catch {}
+  };
+
+  document.getElementById('lfind').oninput = e => { libState.find = e.target.value; libRenderList(); };
+  document.getElementById('lliteral').onclick = () => {
+    if (!libState.saveOk) return libMsg('儲存未能正常讀寫；請先備份現有程式。');
+    libState.progs = libAddExamples(libState.progs);
+    libState.sel = LP_LITERAL_EXAMPLES[0].id;
+    libState.find = '';
+    document.getElementById('lfind').value = '';
+    libSave(); libRender();
+    libMsg('已載入三條及四條原句版；以 CMPLX／DEG 執行。');
+  };
+  document.getElementById('lnew').onclick = () => {
+    const p = { id: libId(), name: '未命名', mode: 'COMP', src: '', note: '', status: 'draft', angle: 'deg', updated: libNow() };
+    libState.progs.unshift(p);
+    libState.sel = p.id; libState.run = null;
+    libSave(); libRender();
+    const n = document.getElementById('lname'); if (n) { n.focus(); n.select(); }
+  };
+  document.getElementById('lexp').onclick = () => libDownload(libState.progs, `fx50-code-book-${libNow()}.json`);
+  // A page opened through the artifact viewer is not allowed to hand the
+  // browser a file, so "匯出檔案" does nothing there and it would be easy to
+  // believe the library had been saved when it had not. This one works
+  // anywhere: the same JSON, straight to the clipboard.
+  document.getElementById('lcopyall').onclick = async ev => {
+    const data = JSON.stringify(makeProgramFile(libState.progs, libState.sel), null, 2);
+    try {
+      await navigator.clipboard.writeText(data);
+      libMsg(`複製咗成個程式簿（${libState.progs.length} 條）。貼落一個 .json 檔就係你嘅正本。`);
+    } catch (e) {
+      ev.currentTarget.textContent = '複製唔到';
+      setTimeout(() => { ev.currentTarget.textContent = '複製全部'; }, 2500);
+    }
+  };
+  document.getElementById('lteach').textContent = `四個教學範例 · ${TEACHING_PROGRAMS.reduce((n,p) => n + byteCount(normalize(p.src)),0)}/${TOTAL_BYTES} B`;
+  document.getElementById('lundoimport').onclick = libUndoImport;
+  document.getElementById('lteach').onclick = () => {
+    const previous = JSON.parse(JSON.stringify(libState.progs)), selected = libState.sel;
+    const existing = new Set(libState.progs.map(p => p.id));
+    const additions = TEACHING_PROGRAMS.filter(p => !existing.has(p.id)).map(p => JSON.parse(JSON.stringify(p)));
+    if (!additions.length) return libMsg('四個教學範例已在程式簿；原有編輯不會被覆蓋。');
+    libState.progs = additions.concat(libState.progs); libState.sel = additions[0].id;
+    libState.run = null; libSave(); libRender(); libRememberImport(previous, selected);
+    libMsg(`已加入 ${additions.length} 個你原有的教學程式，包含輸入、輸出及例題。載入計數機時仍會檢查容量及確認取代指定 P 區。`);
+  };
+  document.getElementById('limp').onclick = () => document.getElementById('lfile').click();
+  document.getElementById('lfile').onchange = ev => {
+    const f = ev.target.files && ev.target.files[0];
+    if (!f) return;
+    const rd = new FileReader();
+    rd.onload = () => {
+      let got = null;
+      try { got = libAdopt(JSON.parse(rd.result)); } catch (e) { /* not json */ }
+      if (!got || !got.length) return libMsg('呢個檔案讀唔到（要係程式簿或者計數機匯出嗰個 JSON）。');
+      // Added, never replaced: importing must not be able to wipe the library.
+      const previous = JSON.parse(JSON.stringify(libState.progs)), selected = libState.sel;
+      got = got.map(p => ({ ...p, id: libId() }));
+      libState.progs = got.concat(libState.progs);
+      libState.sel = got[0].id;
+      libSave(); libRender();
+      libRememberImport(previous, selected);
+      libMsg(`匯入咗 ${got.length} 條（加落去，冇冚走原本嘅）。`);
+    };
+    rd.onerror = () => libMsg('讀取檔案失敗；已有程式未有更改。');
+    rd.readAsText(f);
+    ev.target.value = '';
+  };
+
+  libLoad();
+  libRender();
+  libSaveStatus();
+}
+
+if (typeof document !== 'undefined' && document.getElementById) libBoot();
+
+// The bundle has no module system, so the packaged page hangs its testable
+// parts here — the same trick ui.mjs uses for window.fx.
+if (typeof window !== 'undefined') window.fx50lib = { libAdopt, libHighlight, libWhere, libNextAsk, libErrorDetail, libStart, libStep, libReplaceVariable, libSelectionBytes, libSaveProgram, libAddExamples, libSwapVariables, libTemporaryVariables, libVariableSpans };
+
+
+
+</script>
+</body>
+</html>
