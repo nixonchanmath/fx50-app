@@ -18,8 +18,8 @@
 // feedback form, so a tester's report can be matched to the build they ran.
 // Bump MINOR when a mode lands (BASE / SD / REG / FMLA) or something as big
 // as swapping out the whole display font; PATCH for fixes.
-const VERSION = '0.11.0';
-const BUILD_DATE = '2026-10-13';
+const VERSION = '0.17.1';
+const BUILD_DATE = '2026-11-12';
 // build.mjs replaces this one declaration when producing the 3650 build.
 const MODEL = '50FHII';
 
@@ -420,6 +420,9 @@ const LIT = [
   ['=', 'REL', 'eq'], ['>', 'REL', 'gt'], ['<', 'REL', 'lt'],
   ['×', 'OP', 'mul'], ['*', 'OP', 'mul'], ['÷', 'OP', 'div'], ['/', 'OP', 'div'],
   ['+', 'OP', 'addop'], ['-', 'OP', 'subop'], ['−', 'OP', 'subop'],
+  // ⊖ is the (−) key itself: a sign only. After a value it is a Syntax ERROR
+  // (Nixon, 2026-11-11: "3 minus 2 is 1 vs 3 negative 2 is syntax error").
+  ['⊖', 'OP', 'negop'],
   ['^', 'OP', 'pow'],
   ['(', 'LP', null], [')', 'RP', null], [',', 'COMMA', null],
   ['!', 'POST', 'fact'], ['%', 'POST', 'pct'],
@@ -443,6 +446,8 @@ function lex(src) {
     if (nm && /[\d.]/.test(c)) {
       out.push({ type: 'NUM', text: nm[0].replace('ᴇ', 'E'), hasPoint: nm[0].includes('.'), pos: i });
       i += nm[0].length;
+      // a second point in one number (1.2.3) is a Syntax ERROR (Nixon, 2026-11-11)
+      if (src[i] === '.' && nm[0].includes('.')) { const e = new CalcError('Syntax ERROR'); e.pos = i; throw e; }
       continue;
     }
     // EXP with no mantissa in front of it means 1: ᴇ3 is 1000.
@@ -519,7 +524,7 @@ class Parser {
   atom() {
     const t = this.peek();
     if (!t) this.fail();
-    if (t.type === 'OP' && t.val === 'subop') { this.next(); return { k: 'neg', x: this.expr(BP.prefix) }; }
+    if (t.type === 'OP' && (t.val === 'subop' || t.val === 'negop')) { this.next(); return { k: 'neg', x: this.expr(BP.prefix) }; }
     if (t.type === 'OP' && t.val === 'addop') { this.next(); return this.expr(BP.prefix); }
     this.next();
     switch (t.type) {
@@ -596,6 +601,7 @@ class Parser {
           left = { k: 'bin', op: o, l: left, r: this.expr(BP.muldiv + 1) };
           continue;
         }
+        if (o === 'negop') { const e = new CalcError('Syntax ERROR'); e.pos = t.pos; throw e; }
         if (o === 'addop' || o === 'subop') {
           if (BP.addsub < minbp) break;
           this.next();
@@ -1310,10 +1316,11 @@ function normalize(src) {
     .replace(/d\/dx\s*\(/gi, 'd∕dx(')
     .replace(/\//g, '÷').replace(/\*/g, '×')
     .replace(/d∕dx\(/g, 'd/dx(')
-    // Every dash comes in as the plain one — en dash and em dash (phone and
-    // Mac autocorrect), and the long bar itself. longMinus() below is the one
-    // thing that decides which of the two the machine would draw.
-    .replace(/[–—−]/g, '-')
+    // A typed dash (plain, en, em — phone and Mac autocorrect) is ambiguous,
+    // so longMinus() below decides from context. The long bar − is the
+    // subtract KEY and is kept exactly as pressed: Nixon, 2026-11-11, "dun
+    // switch it, it is what it is" (− 2 at the start works like (−) 2).
+    .replace(/[–—]/g, '-')
     // The inverse trig keys are ONE key each on the machine (SHIFT sin, …), so
     // they must be typeable without hunting for the ⁻¹ character. Accept
     // 'cos-1(', 'cos^-1(' and 'acos(' and rewrite them to the real token —
@@ -1357,6 +1364,11 @@ function normalize(src) {
 // pattern only accepts ASCII, so that one must never be touched.
 const VALUE_END = ')²³¹!°ʳᵍ#π%';
 const NOT_A_VALUE = /^(?:While|WhileEnd|If|Then|Else|IfEnd|For|To|Step|Next|Break|Goto|Lbl|Prog|Deg|Rad|Gra|Fix|Sci|Norm|ClrMemory|ClrStat|Scl)$/;
+/** Would a dash typed at the end of `s` be a subtraction (it follows a value)?
+ *  The glass uses this to keep a (−) pressed after a value as ⊖, the sign key
+ *  itself — which is a Syntax ERROR there, exactly as in a calculation
+ *  (Nixon, 2026-11-11: "if it's error normally, its error everywhere"). */
+function followsValue(s) { return longMinus(s + '-').endsWith('−'); }
 function longMinus(s) {
   let out = '';
   for (let i = 0; i < s.length; i++) {
@@ -1398,7 +1410,14 @@ function scan(src) {
   for (let i = 0; i < s.length;) {
     const c = s[i];
     if (c === ':') { flush(); out.push({ t: 'sep', p: i }); i++; continue; }
-    if (c === '\n') { flush(); out.push({ t: 'sep', free: true, p: i }); i++; continue; }
+    if (c === '\n') {
+      // A line break right after ':' or ◢ (or at the start, or after another
+      // break) is only layout — it costs nothing and the machine never sees it.
+      // Anywhere else it stands for the ':' the machine would need there.
+      const before = s.slice(0, i).replace(/[ \t]+$/, '');
+      const layout = !before || /[:◢\n]$/.test(before);
+      flush(); out.push(layout ? { t: 'sep', free: true, p: i } : { t: 'sep', p: i }); i++; continue;
+    }
     if (c === '◢') { flush(); out.push({ t: 'disp', p: i }); i++; continue; }
     if (c === '⇒') { flush(); out.push({ t: 'arrow', p: i }); i++; continue; }
     const prev = s[i - 1];
@@ -1428,13 +1447,11 @@ function byteCount(src) {
   }
   return n;
 }
-function countExpr(src) {
-  // count engine tokens; digits count individually
-  let n = 0;
-  const s = src.replace(/\s+/g, '');
-  // Longest first. The ∧ and ˣ√ keys each type an opening bracket with them,
-  // so "^(" and "ˣ√(" cost one byte, not two — as Nixon's byte listings show.
-  const multi = [...SCI_NAMES,'sinh⁻¹(', 'cosh⁻¹(', 'tanh⁻¹(', 'sin⁻¹(', 'cos⁻¹(', 'tan⁻¹(', 'sinh(', 'cosh(',
+/** The program split into the keys that typed it — one entry per byte, in
+ *  order, exactly as byteCount() counts them. A free line break comes back as
+ *  '\n' (it costs nothing). The on-glass program editor moves its cursor and
+ *  deletes one of these at a time, the way the machine does. */
+const MULTI_KEYS = [...SCI_NAMES,'sinh⁻¹(', 'cosh⁻¹(', 'tanh⁻¹(', 'sin⁻¹(', 'cos⁻¹(', 'tan⁻¹(', 'sinh(', 'cosh(',
     'tanh(', 'sin(', 'cos(', 'tan(', 'log(', 'ln(', 'e^(', '10^(', '³√(', '√(', 'Abs(', 'Rnd(',
     'Pol(', 'Rec(', 'Conjg(', 'arg(', '∫(', 'd/dx(', 'Ran#', 'Ans', 'nPr', 'nCr', 'ˣ√(', 'ˣ√', '^(',
     '⁻¹', '▸a+bi', '▸r∠θ', 'NA', 'ε₀',
@@ -1443,6 +1460,45 @@ function countExpr(src) {
     // before 'Σx'.  'n' needs no entry — single characters already cost one.
     // 'σx²' is the σx key then the x² key, so it stays two bytes.
     'regA','regB','regR','Σx²y','Σx³','Σx⁴','Σxy','Σy²','Σy','ȳ','σy','sy','x̂','ŷ','Σx²', 'Σx', 'x̄', 'σx', 'sx', 'minX', 'maxX'].sort((a,b)=>b.length-a.length);
+
+function byteTokens(src) {
+  const out = [];
+  for (const t of scan(src)) {
+    if (t.t === 'sep') { out.push(t.free ? '\n' : ':'); continue; }
+    if (t.t === 'disp') { out.push('◢'); continue; }
+    if (t.t === 'arrow') { out.push('⇒'); continue; }
+    if (t.t === 'kw') { out.push(t.v); continue; }
+    const s = t.v.replace(/\s+/g, '');
+    for (let i = 0; i < s.length;) {
+      const rest = s.slice(i);
+      const m = (rest === 'M+' || rest === 'M−' || rest === 'M-') ? rest : MULTI_KEYS.find(k => rest.startsWith(k));
+      if (m) { out.push(m); i += m.length; } else { out.push(s[i]); i++; }
+    }
+  }
+  return out;
+}
+
+/** Put byteTokens() back together. Two words side by side need a space, or
+ *  the scanner reads "If"+"M" as one word "IfM". */
+function joinTokens(toks) {
+  // A space only where the scanner needs one to see a command word: before or
+  // after If/Then/To/Goto/… when a letter touches it. Two variables side by
+  // side stay together — `4AC` must never come back as `4A C`.
+  let s = '', prev = '';
+  for (const t of toks) {
+    if (s && /[A-Za-z]$/.test(s) && /^[A-Za-z]/.test(t) && (KW.includes(prev) || KW.includes(t))) s += ' ';
+    s += t; prev = t;
+  }
+  return s;
+}
+
+function countExpr(src) {
+  // count engine tokens; digits count individually
+  let n = 0;
+  const s = src.replace(/\s+/g, '');
+  // Longest first. The ∧ and ˣ√ keys each type an opening bracket with them,
+  // so "^(" and "ˣ√(" cost one byte, not two — as Nixon's byte listings show.
+  const multi = MULTI_KEYS;
   for (let i = 0; i < s.length;) {
     const rest = s.slice(i);
     const m = multi.find(k => rest.startsWith(k));
@@ -1453,7 +1509,23 @@ function countExpr(src) {
 }
 
 // ----------------------------------------------------------------- compiler
+/** Compile a program. A structure mistake (IfEnd with no If, For with no
+ *  Next, If with no Then, …) must not stop the program before it starts: the
+ *  machine runs everything up to the bad statement and only then shows
+ *  Syntax ERROR (Nixon, 2026-11-11). So on such an error the program is
+ *  compiled again up to the start of that statement, followed by an ERR
+ *  instruction that raises the error when execution gets there. */
 function compile(src) {
+  try { return compileCore(src, null); } catch (e) {
+    if (!(e instanceof CalcError) || e.kind !== 'Syntax ERROR' || e.pos == null) throw e;
+    let stopAt = 0;
+    for (const t of scan(src)) if ((t.t === 'sep' || t.t === 'disp') && t.p < e.pos) stopAt = t.p + 1;
+    try { return compileCore(src, stopAt, e.pos); } catch { throw e; }
+  }
+}
+/** Strict check for the studio and imports: throws on any syntax mistake. */
+function checkProgram(src) { return compileCore(src, null); }
+function compileCore(src, stopAt, errAt) {
   const T = scan(src);
   // The machine shows the source text of the statement it is displaying on the
   // upper line while a ◢ holds — Nixon's 2026-08-09 recording reads
@@ -1477,6 +1549,7 @@ function compile(src) {
 
   for (let i = 0; i < T.length; i++) {
     const t = T[i];
+    if (stopAt != null && t.p >= stopAt) break;
 
     if (t.t === 'sep') { segStart = t.p + 1; closeArrow(); continue; }
     if (t.t === 'disp') {
@@ -1510,6 +1583,10 @@ function compile(src) {
         // forbidden (Nixon, 2026-10-05); mixed For/While is unverified.
         if (blocks.some(b => b.type === 'if')) pSynErr(t.p);
         const ct = nextTok(++i, t.p);
+        // An If needs its Then (fx-72F manual p.79: leaving it out is a
+        // Syntax ERROR). It may follow the condition directly or after ':'.
+        { let j = i + 1; if (T[j] && T[j].t === 'sep') j++;
+          if (!T[j] || T[j].t !== 'kw' || T[j].v !== 'Then') pSynErr(t.p); }
         // REAL, Nixon 2026-10-06: evaluating an If condition preserves Ans.
         // While also preserves Ans; the conditional arrow updates it.
         blocks.push({ type: 'if', jz: emit({ op: 'JZ', src: ct.v, at: ct.p, target: -1, preserveAns: true }), jmp: null });
@@ -1584,6 +1661,16 @@ function compile(src) {
       default: emit({ op: 'SETUP', cmd: t.v, at: t.p }); break;   // Deg/Rad/Gra/ClrMemory/…
     }
   }
+  if (stopAt != null) {
+    // the bad statement: everything before it runs, then the error
+    closeArrow();
+    emit({ op: 'ERR', at: errAt });
+    for (const b of blocks) {
+      if (b.type === 'if') code[b.jmp !== null ? b.jmp : b.jz].target = code.length;
+      else { code[b.type === 'for' ? b.test : b.jz].target = code.length; b.breaks.forEach(x => { code[x].target = code.length; }); }
+    }
+    return { code, labels };
+  }
   // IfEnd may be left off the end of a program — the machine accepts it and the
   // If simply runs to the end (SPEC §10). Five of Nixon's eight published
   // programs end this way. For/While still have to be closed.
@@ -1656,6 +1743,7 @@ function* run(program, ctx, opts = {}) {
         break;
       }
       case 'JMP': pc = I.target; break;
+      case 'ERR': locate(I, () => { throw new CalcError('Syntax ERROR'); }); break;
       case 'GOTO': {
         const t = labels[I.n];
         if (t === undefined) locate(I, () => { throw new CalcError('Go ERROR'); });
@@ -2204,7 +2292,7 @@ function libBytes(p) {
 function libStatus(p) {
   if (!p.src.trim()) return { ok: null, msg: '仲未寫嘢' };
   if (libTemporaryVariables(p.src).length) return {ok:false,msg:'暫用變數 Z 尚未換回：真機只有 A B C D X Y M'};
-  try { compile(p.src); return { ok: true, msg: '編譯到' }; }
+  try { checkProgram(p.src); return { ok: true, msg: '編譯到' }; }
   catch (e) {
     const at = typeof e.progPos === 'number' ? libWhere(normalize(p.src), e.progPos) : '';
     return { ok: false, msg: (e.kind || e.message || '錯') + (at ? `（${at}）` : '') };
@@ -2740,7 +2828,7 @@ function libBoot() {
   app.innerHTML = `<div class="lapp">
     <div class="ltop">
       <button id="lsidetoggle" aria-expanded="true">收起程式列表</button>
-      <h1>50FH Program Code Book · 程式簿</h1><a href="${locationPathForCalc()}">計數機</a><a href="lp-n.html">LP · N 條約束</a><span class="ver">v${VERSION}</span>
+      <h1>50FH Program Code Book · 程式簿</h1><a href="${locationPathForCalc()}">計數機</a><span class="ver">v${VERSION}</span>
       <span class="grow"></span>
       <input id="lfind" placeholder="搵…（名、用法、程式內容）">
       <button id="lnew" class="go">+ 新增</button>

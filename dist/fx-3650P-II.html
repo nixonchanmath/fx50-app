@@ -18,8 +18,8 @@
 // feedback form, so a tester's report can be matched to the build they ran.
 // Bump MINOR when a mode lands (BASE / SD / REG / FMLA) or something as big
 // as swapping out the whole display font; PATCH for fixes.
-const VERSION = '0.11.0';
-const BUILD_DATE = '2026-10-13';
+const VERSION = '0.17.1';
+const BUILD_DATE = '2026-11-12';
 // build.mjs replaces this one declaration when producing the 3650 build.
 const MODEL = '3650PII';
 
@@ -420,6 +420,9 @@ const LIT = [
   ['=', 'REL', 'eq'], ['>', 'REL', 'gt'], ['<', 'REL', 'lt'],
   ['×', 'OP', 'mul'], ['*', 'OP', 'mul'], ['÷', 'OP', 'div'], ['/', 'OP', 'div'],
   ['+', 'OP', 'addop'], ['-', 'OP', 'subop'], ['−', 'OP', 'subop'],
+  // ⊖ is the (−) key itself: a sign only. After a value it is a Syntax ERROR
+  // (Nixon, 2026-11-11: "3 minus 2 is 1 vs 3 negative 2 is syntax error").
+  ['⊖', 'OP', 'negop'],
   ['^', 'OP', 'pow'],
   ['(', 'LP', null], [')', 'RP', null], [',', 'COMMA', null],
   ['!', 'POST', 'fact'], ['%', 'POST', 'pct'],
@@ -443,6 +446,8 @@ function lex(src) {
     if (nm && /[\d.]/.test(c)) {
       out.push({ type: 'NUM', text: nm[0].replace('ᴇ', 'E'), hasPoint: nm[0].includes('.'), pos: i });
       i += nm[0].length;
+      // a second point in one number (1.2.3) is a Syntax ERROR (Nixon, 2026-11-11)
+      if (src[i] === '.' && nm[0].includes('.')) { const e = new CalcError('Syntax ERROR'); e.pos = i; throw e; }
       continue;
     }
     // EXP with no mantissa in front of it means 1: ᴇ3 is 1000.
@@ -519,7 +524,7 @@ class Parser {
   atom() {
     const t = this.peek();
     if (!t) this.fail();
-    if (t.type === 'OP' && t.val === 'subop') { this.next(); return { k: 'neg', x: this.expr(BP.prefix) }; }
+    if (t.type === 'OP' && (t.val === 'subop' || t.val === 'negop')) { this.next(); return { k: 'neg', x: this.expr(BP.prefix) }; }
     if (t.type === 'OP' && t.val === 'addop') { this.next(); return this.expr(BP.prefix); }
     this.next();
     switch (t.type) {
@@ -596,6 +601,7 @@ class Parser {
           left = { k: 'bin', op: o, l: left, r: this.expr(BP.muldiv + 1) };
           continue;
         }
+        if (o === 'negop') { const e = new CalcError('Syntax ERROR'); e.pos = t.pos; throw e; }
         if (o === 'addop' || o === 'subop') {
           if (BP.addsub < minbp) break;
           this.next();
@@ -1310,10 +1316,11 @@ function normalize(src) {
     .replace(/d\/dx\s*\(/gi, 'd∕dx(')
     .replace(/\//g, '÷').replace(/\*/g, '×')
     .replace(/d∕dx\(/g, 'd/dx(')
-    // Every dash comes in as the plain one — en dash and em dash (phone and
-    // Mac autocorrect), and the long bar itself. longMinus() below is the one
-    // thing that decides which of the two the machine would draw.
-    .replace(/[–—−]/g, '-')
+    // A typed dash (plain, en, em — phone and Mac autocorrect) is ambiguous,
+    // so longMinus() below decides from context. The long bar − is the
+    // subtract KEY and is kept exactly as pressed: Nixon, 2026-11-11, "dun
+    // switch it, it is what it is" (− 2 at the start works like (−) 2).
+    .replace(/[–—]/g, '-')
     // The inverse trig keys are ONE key each on the machine (SHIFT sin, …), so
     // they must be typeable without hunting for the ⁻¹ character. Accept
     // 'cos-1(', 'cos^-1(' and 'acos(' and rewrite them to the real token —
@@ -1357,6 +1364,11 @@ function normalize(src) {
 // pattern only accepts ASCII, so that one must never be touched.
 const VALUE_END = ')²³¹!°ʳᵍ#π%';
 const NOT_A_VALUE = /^(?:While|WhileEnd|If|Then|Else|IfEnd|For|To|Step|Next|Break|Goto|Lbl|Prog|Deg|Rad|Gra|Fix|Sci|Norm|ClrMemory|ClrStat|Scl)$/;
+/** Would a dash typed at the end of `s` be a subtraction (it follows a value)?
+ *  The glass uses this to keep a (−) pressed after a value as ⊖, the sign key
+ *  itself — which is a Syntax ERROR there, exactly as in a calculation
+ *  (Nixon, 2026-11-11: "if it's error normally, its error everywhere"). */
+function followsValue(s) { return longMinus(s + '-').endsWith('−'); }
 function longMinus(s) {
   let out = '';
   for (let i = 0; i < s.length; i++) {
@@ -1398,7 +1410,14 @@ function scan(src) {
   for (let i = 0; i < s.length;) {
     const c = s[i];
     if (c === ':') { flush(); out.push({ t: 'sep', p: i }); i++; continue; }
-    if (c === '\n') { flush(); out.push({ t: 'sep', free: true, p: i }); i++; continue; }
+    if (c === '\n') {
+      // A line break right after ':' or ◢ (or at the start, or after another
+      // break) is only layout — it costs nothing and the machine never sees it.
+      // Anywhere else it stands for the ':' the machine would need there.
+      const before = s.slice(0, i).replace(/[ \t]+$/, '');
+      const layout = !before || /[:◢\n]$/.test(before);
+      flush(); out.push(layout ? { t: 'sep', free: true, p: i } : { t: 'sep', p: i }); i++; continue;
+    }
     if (c === '◢') { flush(); out.push({ t: 'disp', p: i }); i++; continue; }
     if (c === '⇒') { flush(); out.push({ t: 'arrow', p: i }); i++; continue; }
     const prev = s[i - 1];
@@ -1428,13 +1447,11 @@ function byteCount(src) {
   }
   return n;
 }
-function countExpr(src) {
-  // count engine tokens; digits count individually
-  let n = 0;
-  const s = src.replace(/\s+/g, '');
-  // Longest first. The ∧ and ˣ√ keys each type an opening bracket with them,
-  // so "^(" and "ˣ√(" cost one byte, not two — as Nixon's byte listings show.
-  const multi = [...SCI_NAMES,'sinh⁻¹(', 'cosh⁻¹(', 'tanh⁻¹(', 'sin⁻¹(', 'cos⁻¹(', 'tan⁻¹(', 'sinh(', 'cosh(',
+/** The program split into the keys that typed it — one entry per byte, in
+ *  order, exactly as byteCount() counts them. A free line break comes back as
+ *  '\n' (it costs nothing). The on-glass program editor moves its cursor and
+ *  deletes one of these at a time, the way the machine does. */
+const MULTI_KEYS = [...SCI_NAMES,'sinh⁻¹(', 'cosh⁻¹(', 'tanh⁻¹(', 'sin⁻¹(', 'cos⁻¹(', 'tan⁻¹(', 'sinh(', 'cosh(',
     'tanh(', 'sin(', 'cos(', 'tan(', 'log(', 'ln(', 'e^(', '10^(', '³√(', '√(', 'Abs(', 'Rnd(',
     'Pol(', 'Rec(', 'Conjg(', 'arg(', '∫(', 'd/dx(', 'Ran#', 'Ans', 'nPr', 'nCr', 'ˣ√(', 'ˣ√', '^(',
     '⁻¹', '▸a+bi', '▸r∠θ', 'NA', 'ε₀',
@@ -1443,6 +1460,45 @@ function countExpr(src) {
     // before 'Σx'.  'n' needs no entry — single characters already cost one.
     // 'σx²' is the σx key then the x² key, so it stays two bytes.
     'regA','regB','regR','Σx²y','Σx³','Σx⁴','Σxy','Σy²','Σy','ȳ','σy','sy','x̂','ŷ','Σx²', 'Σx', 'x̄', 'σx', 'sx', 'minX', 'maxX'].sort((a,b)=>b.length-a.length);
+
+function byteTokens(src) {
+  const out = [];
+  for (const t of scan(src)) {
+    if (t.t === 'sep') { out.push(t.free ? '\n' : ':'); continue; }
+    if (t.t === 'disp') { out.push('◢'); continue; }
+    if (t.t === 'arrow') { out.push('⇒'); continue; }
+    if (t.t === 'kw') { out.push(t.v); continue; }
+    const s = t.v.replace(/\s+/g, '');
+    for (let i = 0; i < s.length;) {
+      const rest = s.slice(i);
+      const m = (rest === 'M+' || rest === 'M−' || rest === 'M-') ? rest : MULTI_KEYS.find(k => rest.startsWith(k));
+      if (m) { out.push(m); i += m.length; } else { out.push(s[i]); i++; }
+    }
+  }
+  return out;
+}
+
+/** Put byteTokens() back together. Two words side by side need a space, or
+ *  the scanner reads "If"+"M" as one word "IfM". */
+function joinTokens(toks) {
+  // A space only where the scanner needs one to see a command word: before or
+  // after If/Then/To/Goto/… when a letter touches it. Two variables side by
+  // side stay together — `4AC` must never come back as `4A C`.
+  let s = '', prev = '';
+  for (const t of toks) {
+    if (s && /[A-Za-z]$/.test(s) && /^[A-Za-z]/.test(t) && (KW.includes(prev) || KW.includes(t))) s += ' ';
+    s += t; prev = t;
+  }
+  return s;
+}
+
+function countExpr(src) {
+  // count engine tokens; digits count individually
+  let n = 0;
+  const s = src.replace(/\s+/g, '');
+  // Longest first. The ∧ and ˣ√ keys each type an opening bracket with them,
+  // so "^(" and "ˣ√(" cost one byte, not two — as Nixon's byte listings show.
+  const multi = MULTI_KEYS;
   for (let i = 0; i < s.length;) {
     const rest = s.slice(i);
     const m = multi.find(k => rest.startsWith(k));
@@ -1453,7 +1509,23 @@ function countExpr(src) {
 }
 
 // ----------------------------------------------------------------- compiler
+/** Compile a program. A structure mistake (IfEnd with no If, For with no
+ *  Next, If with no Then, …) must not stop the program before it starts: the
+ *  machine runs everything up to the bad statement and only then shows
+ *  Syntax ERROR (Nixon, 2026-11-11). So on such an error the program is
+ *  compiled again up to the start of that statement, followed by an ERR
+ *  instruction that raises the error when execution gets there. */
 function compile(src) {
+  try { return compileCore(src, null); } catch (e) {
+    if (!(e instanceof CalcError) || e.kind !== 'Syntax ERROR' || e.pos == null) throw e;
+    let stopAt = 0;
+    for (const t of scan(src)) if ((t.t === 'sep' || t.t === 'disp') && t.p < e.pos) stopAt = t.p + 1;
+    try { return compileCore(src, stopAt, e.pos); } catch { throw e; }
+  }
+}
+/** Strict check for the studio and imports: throws on any syntax mistake. */
+function checkProgram(src) { return compileCore(src, null); }
+function compileCore(src, stopAt, errAt) {
   const T = scan(src);
   // The machine shows the source text of the statement it is displaying on the
   // upper line while a ◢ holds — Nixon's 2026-08-09 recording reads
@@ -1477,6 +1549,7 @@ function compile(src) {
 
   for (let i = 0; i < T.length; i++) {
     const t = T[i];
+    if (stopAt != null && t.p >= stopAt) break;
 
     if (t.t === 'sep') { segStart = t.p + 1; closeArrow(); continue; }
     if (t.t === 'disp') {
@@ -1510,6 +1583,10 @@ function compile(src) {
         // forbidden (Nixon, 2026-10-05); mixed For/While is unverified.
         if (blocks.some(b => b.type === 'if')) pSynErr(t.p);
         const ct = nextTok(++i, t.p);
+        // An If needs its Then (fx-72F manual p.79: leaving it out is a
+        // Syntax ERROR). It may follow the condition directly or after ':'.
+        { let j = i + 1; if (T[j] && T[j].t === 'sep') j++;
+          if (!T[j] || T[j].t !== 'kw' || T[j].v !== 'Then') pSynErr(t.p); }
         // REAL, Nixon 2026-10-06: evaluating an If condition preserves Ans.
         // While also preserves Ans; the conditional arrow updates it.
         blocks.push({ type: 'if', jz: emit({ op: 'JZ', src: ct.v, at: ct.p, target: -1, preserveAns: true }), jmp: null });
@@ -1584,6 +1661,16 @@ function compile(src) {
       default: emit({ op: 'SETUP', cmd: t.v, at: t.p }); break;   // Deg/Rad/Gra/ClrMemory/…
     }
   }
+  if (stopAt != null) {
+    // the bad statement: everything before it runs, then the error
+    closeArrow();
+    emit({ op: 'ERR', at: errAt });
+    for (const b of blocks) {
+      if (b.type === 'if') code[b.jmp !== null ? b.jmp : b.jz].target = code.length;
+      else { code[b.type === 'for' ? b.test : b.jz].target = code.length; b.breaks.forEach(x => { code[x].target = code.length; }); }
+    }
+    return { code, labels };
+  }
   // IfEnd may be left off the end of a program — the machine accepts it and the
   // If simply runs to the end (SPEC §10). Five of Nixon's eight published
   // programs end this way. For/While still have to be closed.
@@ -1656,6 +1743,7 @@ function* run(program, ctx, opts = {}) {
         break;
       }
       case 'JMP': pc = I.target; break;
+      case 'ERR': locate(I, () => { throw new CalcError('Syntax ERROR'); }); break;
       case 'GOTO': {
         const t = labels[I.n];
         if (t === undefined) locate(I, () => { throw new CalcError('Go ERROR'); });
@@ -1755,7 +1843,7 @@ const ROWS = [
   ] },
 
   { cls: 'r6', keys: [
-    { id: 'NEG', above: [['∠', 'cx'], ['A', 'al']], k: '(−)', tok: T('-'), al: T('A'), shCx: T('∠'), cls: 'fn' },
+    { id: 'NEG', above: [['∠', 'cx'], ['A', 'al']], k: '(−)', tok: T('-', '⊖'), al: T('A'), shCx: T('∠'), cls: 'fn' },
     { id: 'DMS', above: [['←', 'sh'], ['B', 'al']], k: '°,,,', tok: T('°'), al: T('B'), cls: 'fn sm' },
     { id: 'HYP', above: [['C', 'al']], k: 'hyp', al: T('C'), cls: 'fn' },
     { id: 'SIN', above: [['sin⁻¹', 'sh'], ['D', 'al']], k: 'sin', tok: T('sin('), sh: T('sin⁻¹('), al: T('D'), cls: 'fn' },
@@ -2099,9 +2187,17 @@ const GLYPHS = {
   '7': { seg: sgA | sgB | sgC, w: 1 },
   '8': { seg: sgA | sgB | sgC | sgD | sgE | sgF | sgG, w: 1 },
   '9': { seg: sgA | sgB | sgC | sgD | sgF | sgG, w: 1 },
-  '-': { seg: sgG, w: 1 },
-  '−': { seg: sgG, w: 1 },
+  '-': { seg: sgG, w: 1, minus: true },
+  '−': { seg: sgG, w: 1, minus: true },
   ' ': { seg: 0, w: 1 },
+  // `P-1234` on the EDIT / RUN / DEL Program screens (Nixon's book, p.1).
+  'P': { seg: sgA | sgB | sgE | sgF | sgG, w: 1 },
+  // `CASIO` on the SETUP Contrast screen (Nixon, 2026-11-11).
+  'C': { seg: sgA | sgD | sgE | sgF, w: 1 },
+  'A': { seg: sgA | sgB | sgC | sgE | sgF | sgG, w: 1 },
+  'S': { seg: sgA | sgF | sgG | sgC | sgD, w: 1 },
+  'I': { seg: sgB | sgC, w: 1 },
+  'O': { seg: sgA | sgB | sgC | sgD | sgE | sgF, w: 1 },
   // The point is a segment of the digit's OWN cell, at its bottom right — it
   // does not take a slot of its own, so a ten-digit mantissa is ten cells wide
   // wherever the point falls. (REAL: Nixon's photo of the whole glass shows a
@@ -2119,6 +2215,11 @@ const GLYPHS = {
 // Air between two digit cells, as a multiple of the stroke width. About 0.4 of
 // a digit's own width, which is what the all-segments photo shows.
 const GAP = 1.55;
+// A digit's width as a fraction of its height, and the clear glass left
+// between two segments, as a fraction of the stroke. Both off the real glass
+// (see drawSegChar).
+const DIGIT_ASPECT = 0.42;
+const SEG_SPLIT = 0.08;
 
 const hasSegGlyph = ch => Object.prototype.hasOwnProperty.call(GLYPHS, ch);
 
@@ -2150,60 +2251,50 @@ function drawSegChar(g2, ch, x, y, w, h, t) {
 
   // The glyph box shrinks for the small marks so they hang from the top.
   const bh = g.small ? h * 0.5 : h;
-  // Air between digits, so the point that belongs to this cell sits in a gap of
-  // its own instead of touching the digit beside it. The gap is about 0.4 of a
-  // digit's own width, which is what Nixon's photo of the all-segments display
-  // shows (2026-09-17, second pass — one t of air was still not enough and the
-  // point was landing on the upright of the digit before it).
-  const bw = adv - (g.w < 1 ? 0 : t * GAP);
-  const m = t / 2;                            // half thickness, for the mitres
-  const mid = y + bh / 2;
-
-  // Each segment is a hexagon so the joints mitre instead of butting square,
-  // which is what a real LCD segment looks like. All seven go into ONE path and
-  // are filled together: the mitres overlap, and with a see-through fill (the
-  // unlit ghost field) filling them one at a time stacks the alpha and the
-  // corners come out darker than the bars.
-  const hbar = (cx, cy, len) => {
-    g2.moveTo(cx + m, cy - m); g2.lineTo(cx + len - m, cy - m);
-    g2.lineTo(cx + len, cy);   g2.lineTo(cx + len - m, cy + m);
-    g2.lineTo(cx + m, cy + m); g2.lineTo(cx, cy);
+  // REAL (2026-11-10, frames of fx50-test-Prog1.mov, digits measured at 150px
+  // tall): a digit is about 0.4 of its own height wide, its bars are about a
+  // tenth of its height thick, and the rest of the cell is air for the point.
+  // Ours used to be a fat, wide digit that filled most of its cell.
+  const bw = g.w < 1 ? adv : Math.min(adv - t * GAP, bh * DIGIT_ASPECT);
+  const m = t / 2;                            // half thickness: the pointed tips
+  // Every segment is its own electrode with a hair of clear glass between it
+  // and the next — on the machine you can see each one end. So each bar is a
+  // hexagon pointed at BOTH ends and stops `sg` short of the corner. Nothing
+  // overlaps any more, so the old winding trouble (white slivers at the joins)
+  // cannot come back.
+  const sg = t * SEG_SPLIT;
+  const hbar = (x0, x1, cy) => {
+    const a = x0 + sg, b = x1 - sg;
+    g2.moveTo(a, cy); g2.lineTo(a + m, cy - m); g2.lineTo(b - m, cy - m);
+    g2.lineTo(b, cy); g2.lineTo(b - m, cy + m); g2.lineTo(a + m, cy + m);
     g2.closePath();
   };
-  // A vertical tapers only at the end that meets a HORIZONTAL bar. Where the
-  // two verticals meet EACH OTHER — halfway up the digit — they stop square,
-  // leaving a thin slot. Two points meeting there instead leave a white diamond
-  // bitten out of the side of every 0, 1, 4… which is the first thing Nixon
-  // said about the digits (2026-09-17: "the white little part of numbers").
-  // ⚠️ WINDING MATTERS. All seven segments go into one path and are filled
-  // together, and canvas fills by the nonzero rule: two subpaths that overlap
-  // while running in OPPOSITE directions cancel each other and leave a hole.
-  // That is what bit white slivers out of every corner where a bar met an
-  // upright — Nixon spotted it the moment the digits got bigger. Both helpers
-  // wind CLOCKWISE (right along the top, down, left along the bottom), so the
-  // joins come out solid while the fill still only paints each pixel once.
-  const slot = t * 0.22;
-  const vbar = (cx, cy, len, tipTop, tipBot) => {
-    const top = tipTop ? cy + m : cy + slot;
-    const bot = tipBot ? cy + len - m : cy + len - slot;
-    g2.moveTo(cx - m, top);
-    if (tipTop) g2.lineTo(cx, cy);
-    g2.lineTo(cx + m, top);
-    g2.lineTo(cx + m, bot);
-    if (tipBot) g2.lineTo(cx, cy + len);
-    g2.lineTo(cx - m, bot);
+  const vbar = (cx, y0, y1) => {
+    const a = y0 + sg, b = y1 - sg;
+    g2.moveTo(cx, a); g2.lineTo(cx + m, a + m); g2.lineTo(cx + m, b - m);
+    g2.lineTo(cx, b); g2.lineTo(cx - m, b - m); g2.lineTo(cx - m, a + m);
     g2.closePath();
   };
 
+  // Corner points sit on the bars' centre lines.
+  const L = x + m, R = x + bw - m, T = y + m, M = y + bh / 2, B = y + bh - m;
   g2.beginPath();
-  const half = (bh - t) / 2;
-  if (g.seg & sgA) hbar(x, y + m, bw);
-  if (g.seg & sgG) hbar(x, mid, bw);
-  if (g.seg & sgD) hbar(x, y + bh - m, bw);
-  if (g.seg & sgF) vbar(x + m, y + m, half, true, false);
-  if (g.seg & sgB) vbar(x + bw - m, y + m, half, true, false);
-  if (g.seg & sgE) vbar(x + m, mid, half, false, true);
-  if (g.seg & sgC) vbar(x + bw - m, mid, half, false, true);
+  if (g.minus) {
+    // The sign is a SHORT dash at the right of its cell, not a full bar:
+    // about half a digit wide, close up to the number (REAL, same frames).
+    const a = x + bw * 0.3, e = x + bw;
+    g2.moveTo(a, M); g2.lineTo(a + m, M - m); g2.lineTo(e - m, M - m);
+    g2.lineTo(e, M); g2.lineTo(e - m, M + m); g2.lineTo(a + m, M + m);
+    g2.closePath();
+  } else {
+    if (g.seg & sgA) hbar(L, R, T);
+    if (g.seg & sgG) hbar(L, R, M);
+    if (g.seg & sgD) hbar(L, R, B);
+    if (g.seg & sgF) vbar(L, T, M);
+    if (g.seg & sgB) vbar(R, T, M);
+    if (g.seg & sgE) vbar(L, M, B);
+    if (g.seg & sgC) vbar(R, M, B);
+  }
   g2.fill();
   return adv;
 }
@@ -2347,6 +2438,241 @@ function standardChord(e) {
 }
 
 
+// Which keys type each byte of a program on the fx-50FH II — the "Input" column
+// of Nixon's books, worked out from the keypad itself instead of written by hand.
+//
+// Sources: the keypad table in keys.mjs (what each key types plain, after SHIFT,
+// after ALPHA, and in CMPLX), and the program command menu that the Prog key
+// opens while editing. That menu's pages are the ones in Nixon's appendix
+// (CASIO-0-Appendix.docx, "Program Command Entries": ? = Prog 1, → = Prog 2,
+// ◢ = Prog 4, ⇒ = Prog ▶ 1, If = Prog ◀ 1 …), filled in page by page against
+// CalcX. Every sequence here is checked by actually pressing it on the emulator
+// (test/ui-test.mjs, "teaching keys"), so a wrong entry cannot ship.
+
+
+
+// label on the glass, the numbers under it, and what each number types
+const PCMD = [
+  ['?   →   :   ◢', '1   2   3   4', ['?', '→', ':', '◢']],
+  ['⇒   =   ≠', '1   2   3', ['⇒', '=', '≠']],
+  ['>   <   ≥   ≤', '1   2   3   4', ['>', '<', '≥', '≤']],
+  ['Goto    Lbl', '1       2', ['Goto', 'Lbl']],
+  ['While WhileEnd', '1     2', ['While', 'WhileEnd']],
+  ['Next    Break', '1       2', ['Next', 'Break']],
+  ['For  To   Step', '1    2    3', ['For', 'To', 'Step']],
+  ['Else    IfEnd', '1       2', ['Else', 'IfEnd']],
+  ['If      Then', '1       2', ['If', 'Then']],
+];
+
+// SHIFT MODE while editing: the setup commands a program may carry.
+const SETUP_CMDS = [['Deg', 'Rad', 'Gra'], ['Fix', 'Sci', 'Norm']];
+
+// Bytes that are not simply "this key" or "SHIFT/ALPHA + this key".
+const KEYSEQ_SPECIAL = {
+  ':': ['EXE'], '⊖': ['NEG'],
+  // `E3` in a typed program is the EXP key (×10³); the glass shows it as ᴇ.
+  'E': ['EXP'],
+  'Ans': ['ANS'], 'M+': ['MPLUS'], 'M−': ['SHIFT', 'MPLUS'], 'M-': ['SHIFT', 'MPLUS'],
+  'ClrMemory': ['SHIFT', 'D9', 'D1'], 'ClrStat': ['SHIFT', 'D9', 'D1'],
+  'ʳ': ['SHIFT', 'ANS', 'D2'], 'ᵍ': ['SHIFT', 'ANS', 'D3'],
+  'sinh(': ['HYP', 'SIN'], 'cosh(': ['HYP', 'COS'], 'tanh(': ['HYP', 'TAN'],
+  'sinh⁻¹(': ['SHIFT', 'HYP', 'SIN'], 'cosh⁻¹(': ['SHIFT', 'HYP', 'COS'], 'tanh⁻¹(': ['SHIFT', 'HYP', 'TAN'],
+};
+
+const digitKey = n => 'D' + n;
+
+/** The keys for one byte, or null when we do not know how it is typed. */
+function tokenKeys(t, pmode = 'COMP') {
+  if (KEYSEQ_SPECIAL[t]) return KEYSEQ_SPECIAL[t].slice();
+  if (t === 'i') return pmode === 'CMPLX' ? ['ENG'] : ['ALPHA', 'ENG'];
+  // Prog menu: go round the nine pages whichever way is shorter.
+  for (let p = 0; p < PCMD.length; p++) {
+    const n = PCMD[p][2].indexOf(t);
+    if (n < 0) continue;
+    const back = PCMD.length - p;
+    const arrows = p <= back ? Array(p).fill('RIGHT') : Array(back).fill('LEFT');
+    return ['PROG', ...arrows, digitKey(n + 1)];
+  }
+  for (let p = 0; p < SETUP_CMDS.length; p++) {
+    const n = SETUP_CMDS[p].indexOf(t);
+    if (n >= 0) return ['SHIFT', 'MODE', ...Array(p).fill('RIGHT'), digitKey(n + 1)];
+  }
+  let plain = null, shifted = null, alpha = null;
+  for (const row of ROWS) for (const k of row.keys || []) {
+    if (!k.id) continue;
+    if (k.tok && k.tok.d === t && !plain) plain = [k.id];
+    const sh = pmode === 'CMPLX' && k.shCx ? k.shCx : k.sh;
+    if (sh && sh.d === t && !shifted) shifted = ['SHIFT', k.id];
+    if (k.al && k.al.d === t && !alpha) alpha = ['ALPHA', k.id];
+  }
+  return plain || shifted || alpha || null;
+}
+
+/** A whole program as steps: one per byte, each with the keys that type it. */
+function programKeys(src, pmode = 'COMP') {
+  // a layout line break is not a key — nothing to press for it
+  return byteTokens(src).filter(tok => tok !== '\n').map(tok => ({ tok, keys: tokenKeys(tok, pmode) }));
+}
+
+// Skins: the same machine in different bodies.
+//
+// What a skin may change: the outline of the body, the shape, colour and
+// relief of the keys, the bezel round the glass, the name plate.
+// What it may NOT change: where each key sits (students copy the teacher on
+// their own real machine, so position is function, not decoration), the label
+// colours' MEANING (SHIFT stays a yellow family, ALPHA a red one), and the
+// glass itself (the LCD is drawn to match the real one dot for dot).
+//
+// Nixon, 2026-11-10, on the first colour-only mock-ups: a different colour
+// is not a different calculator. So every new skin below has its own key
+// SHAPE and body SHAPE as well as its own colours.
+//
+// 'classic' is the original look — the base CSS in ui.mjs, no overrides.
+
+const SKINS = [
+  { id: 'nx', name: '石墨' },
+  { id: 'chalk', name: '粉筆' },
+  { id: 'board', name: '白板' },
+  { id: 'classic', name: '經典' },
+];
+const SKIN_DEFAULT = 'nx';
+const SKIN_LS = 'fx50-skin';
+
+function skinById(id) {
+  return SKINS.find(s => s.id === id) || SKINS.find(s => s.id === SKIN_DEFAULT);
+}
+
+// Shared by the three skins of our own: no SUPER-FX line, our own name plate.
+// .model keeps its text (tests read it, and rubbing it still swaps models);
+// the visible label is drawn from data-own instead.
+const OWN = sel => `
+${sel} .superfx{display:none}
+${sel} .model{font-size:0;background-image:none}
+${sel} .model::after{content:attr(data-own);font:800 15px/1.3 "Avenir Next","Helvetica Neue",Arial,sans-serif;letter-spacing:1.5px}
+${sel} .model b{display:none}
+${sel} .brand{height:auto;font:800 9px/1 "Avenir Next","Helvetica Neue",Arial,sans-serif;letter-spacing:2.6px;padding-top:2px}
+${sel} .brand::before{content:'NIXON MATH'}
+${sel} .hkeaa{color:inherit}
+`;
+
+const SKIN_CSS = `
+/* ===== 石墨 nx: a slab. Square corners, square keys, light number keys on a
+   dark body, lemon for the keys you press most (EXE family / Prog). ===== */
+${OWN('body.skin-nx')}
+body.skin-nx #calc{background:#2a2d32;border-radius:12px;padding:5px 5px 9px;
+ box-shadow:0 24px 60px #000c,0 0 0 1px #4a4f57,inset 0 1px 0 #ffffff1a}
+body.skin-nx .face{background:linear-gradient(#34383e,#2b2e33 40%,#26292d);border-radius:9px;
+ padding:12px 12px 8px;box-shadow:inset 0 1px 0 #ffffff14}
+body.skin-nx .brand{color:#e8e24f}
+body.skin-nx .model::after{color:#f1f2f4}
+body.skin-nx .hkeaa{color:#c9ccd1}
+body.skin-nx .solar{height:16px;width:78px;background:#0c0d0f;border-radius:2px}
+body.skin-nx .solar i{background:linear-gradient(#2c2a35,#1c1b23)}
+body.skin-nx .lcd{border:6px solid #0d0e10;border-radius:4px;box-shadow:inset 0 2px 7px #0005,0 0 0 1px #4a4f57}
+body.skin-nx .pad{background:transparent;box-shadow:none;border-radius:0;padding-top:9px}
+body.skin-nx .above{text-shadow:none}
+body.skin-nx .sh{color:#f0c84a}body.skin-nx .al{color:#ff7a7a}body.skin-nx .ba{color:#5fd99a}
+body.skin-nx .cx{color:#c9a2ff}body.skin-nx .st{color:#7db8ff}body.skin-nx .pl{color:#d3d7dd}
+body.skin-nx .key{border-radius:3px;background:#4a5058;color:#f4f5f6;
+ box-shadow:0 2px 0 #16181b,inset 0 1px 0 #ffffff1f}
+body.skin-nx .key:active{box-shadow:0 0 0 #16181b,inset 0 1px 3px #0008}
+body.skin-nx .key.num{background:#e4e6e9;color:#1d2025;box-shadow:0 2px 0 #8d9198,inset 0 1px 0 #fff}
+body.skin-nx .key.num.red{background:#ef5b4c;color:#fff;box-shadow:0 2px 0 #8e2d23,inset 0 1px 0 #ffffff40}
+body.skin-nx .key.orange{background:#e8e24f;color:#202226;text-shadow:none;box-shadow:0 2px 0 #84801d,inset 0 1px 0 #fff8}
+body.skin-nx .key.oval{height:19px;border-radius:3px;background:#5d636c;box-shadow:0 2px 0 #16181b,inset 0 1px 0 #ffffff26}
+body.skin-nx .replay{border-radius:14px;background:#4a5058;box-shadow:0 3px 0 #16181b,inset 0 1px 0 #ffffff1f}
+body.skin-nx .replay::after{border-radius:9px;background:#3d4249;box-shadow:inset 0 1px 2px #0006}
+body.skin-nx .replay .lbl{color:#aab0b8}
+body.skin-nx .replay .rup::before{border-bottom-color:#e8e24f}body.skin-nx .replay .rdn::before{border-top-color:#e8e24f}
+body.skin-nx .replay .rlf::before{border-right-color:#e8e24f}body.skin-nx .replay .rrt::before{border-left-color:#e8e24f}
+body.skin-nx .kc{border-radius:4px;background:#4a5058;box-shadow:0 2px 0 #16181b}
+body.skin-nx .kc.num{background:#e4e6e9;color:#1d2025;box-shadow:0 2px 0 #8d9198}
+body.skin-nx .kc.red{background:#ef5b4c;color:#fff}
+body.skin-nx .kc.orange{background:#e8e24f;color:#202226}
+body.skin-nx .kc.oval,body.skin-nx .kc.arrow{background:#5d636c;color:#f4f5f6;box-shadow:0 2px 0 #16181b}
+
+/* ===== 粉筆 chalk: soft and round. Ivory pebble of a body, every key a pill,
+   slate number keys, teal for Prog. ===== */
+${OWN('body.skin-chalk')}
+body.skin-chalk #calc{background:#e9e2d4;border-radius:44px;padding:8px 8px 14px;
+ box-shadow:0 22px 50px #0009,inset 0 -3px 0 #cfc6b4,inset 0 1px 0 #fff}
+body.skin-chalk .face{background:linear-gradient(#fbf8f1,#f2ede3);border-radius:38px 38px 34px 34px;
+ padding:18px 16px 10px;box-shadow:inset 0 1px 0 #fff,0 1px 2px #0002}
+body.skin-chalk .brand{color:#1f9c92}
+body.skin-chalk .model::after{color:#3b4250}
+body.skin-chalk .hkeaa{color:#3b4250}
+body.skin-chalk .solar{height:20px;width:88px;border-radius:10px;background:#5a5148;padding:3px}
+body.skin-chalk .solar i{border-radius:4px;background:linear-gradient(#8a7a6a,#6c5e50)}
+body.skin-chalk .lcd{border:5px solid #ddd5c6;border-radius:14px;box-shadow:inset 0 2px 7px #0003,0 1px 0 #fff}
+body.skin-chalk .pad{background:transparent;box-shadow:none;padding-top:12px}
+body.skin-chalk .above{text-shadow:none}
+body.skin-chalk .sh{color:#b87100}body.skin-chalk .al{color:#cc3440}body.skin-chalk .ba{color:#11804a}
+body.skin-chalk .cx{color:#7a3fb0}body.skin-chalk .st{color:#1f6cba}body.skin-chalk .pl{color:#4a5160}
+body.skin-chalk .key{border-radius:999px;background:#ddd6c9;color:#2c313a;
+ box-shadow:0 3px 0 #b5ac9b,0 4px 6px #0002,inset 0 1px 0 #fff}
+body.skin-chalk .key:active{box-shadow:0 0 0 #b5ac9b,inset 0 1px 3px #0003}
+body.skin-chalk .key.num{background:#48505d;color:#fff;box-shadow:0 3px 0 #262b33,0 4px 6px #0003,inset 0 1px 0 #ffffff26}
+body.skin-chalk .key.num.red{background:#e0645a;color:#fff;box-shadow:0 3px 0 #9c3a32,0 4px 6px #0003}
+body.skin-chalk .key.orange{background:#22a99e;color:#fff;text-shadow:none;box-shadow:0 3px 0 #127068,0 4px 6px #0003}
+body.skin-chalk .key.oval{height:22px;background:#cfc7b8;box-shadow:0 3px 0 #a99f8d,inset 0 1px 0 #fff}
+body.skin-chalk .replay{background:radial-gradient(circle at 50% 35%,#f3eee4,#d9d1c2);box-shadow:0 3px 0 #b5ac9b,0 5px 10px #0003,inset 0 1px 0 #fff}
+body.skin-chalk .replay::after{background:radial-gradient(circle at 50% 40%,#fbf8f1,#e6dfd2);box-shadow:inset 0 1px 2px #0002}
+body.skin-chalk .replay .lbl{color:#8a8274}
+body.skin-chalk .replay .rup::before{border-bottom-color:#22a99e}body.skin-chalk .replay .rdn::before{border-top-color:#22a99e}
+body.skin-chalk .replay .rlf::before{border-right-color:#22a99e}body.skin-chalk .replay .rrt::before{border-left-color:#22a99e}
+body.skin-chalk .kc{border-radius:999px;background:#ddd6c9;color:#2c313a;box-shadow:0 2px 0 #b5ac9b}
+body.skin-chalk .kc.num{background:#48505d;color:#fff;box-shadow:0 2px 0 #262b33}
+body.skin-chalk .kc.red{background:#e0645a;color:#fff}
+body.skin-chalk .kc.orange{background:#22a99e;color:#fff}
+body.skin-chalk .kc.oval,body.skin-chalk .kc.arrow{background:#cfc7b8;color:#2c313a;box-shadow:0 2px 0 #a99f8d}
+
+/* ===== 白板 board: made for the projector. Flat, no shadows, every key a
+   black outline you can read from the back row. ===== */
+${OWN('body.skin-board')}
+body.skin-board #calc{background:#fff;border-radius:8px;padding:4px 4px 8px;box-shadow:0 0 0 3px #111,0 18px 40px #0008}
+body.skin-board .face{background:#fff;border-radius:6px;padding:12px 12px 8px;box-shadow:none}
+body.skin-board .brand{color:#111}
+body.skin-board .model::after{color:#111}
+body.skin-board .hkeaa{color:#111}
+body.skin-board .solar{height:16px;width:76px;border-radius:0;background:#111;padding:2px}
+body.skin-board .solar i{border-radius:0;background:#3a3a3a}
+body.skin-board .lcd{border:3px solid #111;border-radius:2px;box-shadow:none}
+body.skin-board .pad{background:transparent;box-shadow:none;padding-top:9px}
+body.skin-board .above{text-shadow:none;font-size:8px}
+body.skin-board .sh{color:#a35a00}body.skin-board .al{color:#c1121f}body.skin-board .ba{color:#0b7a3e}
+body.skin-board .cx{color:#6a2fa0}body.skin-board .st{color:#155ab0}body.skin-board .pl{color:#111}
+body.skin-board .key{border-radius:7px;background:#fff;color:#111;border:2px solid #111;box-shadow:none}
+body.skin-board .key:active{transform:translateY(1px);background:#e8e8e8;box-shadow:none}
+body.skin-board .key.num{background:#111;color:#fff;border-color:#111}
+body.skin-board .key.num.red{background:#c1121f;border-color:#c1121f;color:#fff}
+body.skin-board .key.orange{background:#155ab0;border-color:#155ab0;color:#fff;text-shadow:none}
+body.skin-board .key.oval{height:20px;border-radius:999px;background:#fff;box-shadow:none}
+body.skin-board .key.sqrt::after{background:currentColor}
+body.skin-board .replay{background:#fff;box-shadow:0 0 0 2px #111}
+body.skin-board .replay::after{background:#fff;box-shadow:0 0 0 2px #111}
+body.skin-board .replay .lbl{color:#111}
+body.skin-board .replay .rup::before{border-bottom-color:#111}body.skin-board .replay .rdn::before{border-top-color:#111}
+body.skin-board .replay .rlf::before{border-right-color:#111}body.skin-board .replay .rrt::before{border-left-color:#111}
+body.skin-board .key.hit{box-shadow:0 0 0 3px #ffd54a,0 0 16px 5px #ffd54acc}
+body.skin-board .kc{border-radius:7px;background:#fff;color:#111;box-shadow:inset 0 0 0 2px #111}
+body.skin-board .kc.num{background:#111;color:#fff;box-shadow:none}
+body.skin-board .kc.red{background:#c1121f;color:#fff;box-shadow:none}
+body.skin-board .kc.orange{background:#155ab0;color:#fff;box-shadow:none}
+body.skin-board .kc.oval,body.skin-board .kc.arrow{background:#fff;color:#111;box-shadow:inset 0 0 0 2px #111}
+
+/* SHIFT / ALPHA chips in the key record keep their own colours in every skin */
+body[class*="skin-"] .kc.sh{background:#b3781a;color:#fff;box-shadow:0 2px 0 #6e4a10}
+body[class*="skin-"] .kc.al{background:#c0303c;color:#fff;box-shadow:0 2px 0 #741c24}
+
+/* The picker under the machine */
+.skinpick{display:flex;gap:6px;justify-content:center;align-items:center;flex-wrap:wrap;margin:10px auto 0;
+ color:#8b9098;font:13px/1 "PingFang HK",Arial,sans-serif}
+.skinpick button{min-height:34px;padding:0 12px;border-radius:17px;border:1px solid #454d59;background:#2a2f37;
+ color:#cfd5dd;font:600 13px "PingFang HK",Arial,sans-serif;cursor:pointer;display:inline-flex;align-items:center;gap:6px}
+.skinpick button i{width:12px;height:12px;border-radius:50%;display:inline-block;box-shadow:0 0 0 1px #0006}
+.skinpick button.on{background:#e1e8f0;color:#1a2838;border-color:#e1e8f0}
+`;
+
 // ui.mjs imports
 const dadd = add;
 const dsub = sub;
@@ -2356,6 +2682,8 @@ const runProgram = run;
 
 
 // fx-50FH II emulator — user interface (1:1 replica skin)
+
+
 
 
 
@@ -2376,7 +2704,11 @@ const PROGRAM_BYTES = IS_3650 ? 390 : TOTAL_BYTES;
 // A digit cell got wider (23.5 → 25) so the extra air goes between the digits,
 // not into them: that puts the whole eleven-cell field far enough left for the
 // sign cell to sit under the `?` of the left column, where the glass has it.
-const SEG_W = 25, SEG_H = 34, SEG_T = 4.8;   // digit cell, cap height, stroke
+// 2026-11-10: taller and thinner, off frames of fx50-test-Prog1.mov — the
+// real digit is about 1.9× as tall as its cell is wide, with bars a tenth of
+// its height. The glass grew to make room (it was flatter than the machine's
+// 2.6 : 1 anyway, SPEC §8h).
+const SEG_W = 26.9, SEG_H = 44, SEG_T = 4.4;   // digit cell, cap height, stroke
 // How far the digits start below the top of their row. Nixon, 2026-09-17:
 // the band between the two lines was too wide, so this and L2_H both came down
 // by 12 — the digits keep the same clearance under them, the gap halves.
@@ -2385,10 +2717,14 @@ const SEG_TOP = 12;                            // digits sit low in the band
 // all-segments photo, 2026-09-16): ×10 / exponent / i / Disp on the right,
 // and on the left the little dot cell with ? under it, then = , then ∠.
 // Measured off that photo: left ≈ 9% of the glass, right ≈ 10.5%.
-const SEG_GUTTER = 35;                         // the right column, kept clear
+// 51, not 35 (Nixon, 2026-11-10, red box on the real glass): the sign cell
+// sits right under the first dot cell and the first digit under the second.
+// At 35 the whole field sat a cell too far right with dead glass on its left.
+const SEG_GUTTER = 42;                         // the right column, kept clear
 const SEG_LEFT = 2;                            // where the left column starts
-const TAG_P = 1.7;                             // dot pitch of the little tag
-const L2_H = 52;                               // height of the lower band
+const TAG_P = 1.85;                            // dot pitch of the little tag
+const L2_H = 62;                               // height of the lower band
+const SEG_SLANT = 0.14;                        // forward lean of the digits
 // Instructions per slice while a program runs. Between slices the runner hands
 // the event loop back, so a program with no ◢ in it still lets AC through.
 const RUN_TICK = 20000;
@@ -2396,13 +2732,29 @@ const RUN_TICK = 20000;
 // ------------------------------------------------------------------- style
 const CSS = `
 .studio-launch{display:block;margin:12px auto;padding:9px 18px;border:1px solid #738194;border-radius:8px;background:#e1e8f0;color:#1a2838;font:700 14px Arial;cursor:pointer}
+.tools-row{display:flex;gap:8px;justify-content:center;flex-wrap:wrap;margin:12px auto}
+.tools-row .studio-launch{margin:0}
+#fb{position:fixed;inset:0;z-index:50;display:none;align-items:center;justify-content:center;
+ background:#000a;padding:16px}
+#fb.on{display:flex}
+#fb .box{width:100%;max-width:460px;background:#282d35;border:1px solid #3c434e;border-radius:12px;
+ padding:16px;color:#dfe3e8;font:14px/1.5 "PingFang HK",Arial,sans-serif}
+#fb h3{margin:0 0 6px;font-size:16px;color:#f2b134}
+#fb p{margin:0 0 10px;color:#9aa2ad;font-size:13px}
+#fb textarea{width:100%;height:130px;border-radius:8px;border:1px solid #454d59;background:#1b1f25;
+ color:#e8ecf1;font:15px/1.5 inherit;padding:8px;resize:vertical}
+#fb .acts{display:flex;gap:8px;margin-top:10px;flex-wrap:wrap}
+#fb button{flex:1;min-height:44px;border-radius:8px;border:1px solid #454d59;background:#333a44;
+ color:#fff;font:600 14px Arial;cursor:pointer}
+#fb button.go{background:#3d8b5f;border-color:#3d8b5f}
+#fb .done{min-height:1.4em;margin-top:8px;font-size:13px;color:#9fd3b0}
 .sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}
 button:focus-visible,[role=button]:focus-visible,a:focus-visible{outline:3px solid #549cff;outline-offset:3px}
 #eclose{float:right}.etab{font:inherit;color:inherit}.eguide{margin:8px 0 12px;padding:10px;border:1px solid #546071;border-radius:8px;font-size:13px;line-height:1.6}.eguide summary{cursor:pointer;font-weight:700}.eguide p{margin:6px 0}
 
 *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
 body{margin:0;background:#20242b;font-family:"Helvetica Neue",Arial,"PingFang HK","Microsoft JhengHei",sans-serif;
- display:flex;justify-content:center;align-items:flex-start;min-height:100vh;padding:16px}
+ display:flex;justify-content:center;align-items:flex-start;min-height:100vh;padding:16px;overflow-x:hidden}
 #calc{--w:392px;width:var(--w);background:linear-gradient(#1a1c1f,#0d0e10);
  border-radius:26px;padding:7px 7px 12px;box-shadow:0 20px 50px #000a,0 0 0 1px #3a3f47;user-select:none}
 .face{background:linear-gradient(178deg,#f2f3f4 0%,#dcdee1 38%,#c9ccd0 62%,#b7babf 100%);
@@ -2460,20 +2812,20 @@ body.model-arriving .model,body.model-arriving .pad{opacity:0}
    it, like ← and →. The ▲▼ below stay plain triangles — both facts off the
    photo of the whole glass Nixon sent on 2026-09-17. Unlit they stay faintly
    visible, because every segment of a real LCD does. */
-.mk{position:absolute;top:0;height:100%;display:flex;align-items:center;opacity:.06}
+.mk{position:absolute;bottom:2px;height:12px;display:flex;align-items:center;opacity:.06}   /* low beside the text, level with its bottom rows: MODE menu photo 2026-11-10 */
 .mk.on{opacity:1}
-.mk::before{content:'';width:0;height:0;border:4px solid transparent}
-.mk::after{content:'';width:4px;height:2px;background:#141a12}
-.mkl{left:0}
-.mkl::before{border-left:0;border-right:5px solid #141a12}
-.mkr{right:0;flex-direction:row-reverse}
-.mkr::before{border-right:0;border-left:5px solid #141a12}
+.mk::before{content:'';width:0;height:0;border:5px solid transparent}
+.mk::after{content:'';width:4px;height:4px;background:#141a12}
+.mkl{left:-4px}   /* real arrow: 1.8–4.8% of the glass */
+.mkl::before{border-left:0;border-right:6px solid #141a12}
+.mkr{right:-7px;flex-direction:row-reverse}   /* real: 95.8–98.6% */
+.mkr::before{border-right:0;border-left:6px solid #141a12}
 /* ▲▼ belong to this line, stacked above the ▶ — not to the symbol row */
 .ud{position:absolute;right:0;top:0;display:flex;flex-direction:column;line-height:6px}
 .ud b{width:0;height:0;border:3px solid transparent;margin:1px 1px 1px 0;opacity:.13}
 .ud b.on{opacity:1}
-#mku{border-top:0;border-bottom:4px solid #141a12}
-#mkd{border-bottom:0;border-top:4px solid #141a12}
+#mku,[data-mid=mku]{border-top:0;border-bottom:4px solid #141a12}
+#mkd,[data-mid=mkd]{border-bottom:0;border-top:4px solid #141a12}
 /* The upper line is drawn dot by dot on this canvas; #l1 still carries the
    plain text (tests read it, and it keeps the line selectable/copyable). */
 .l1c{position:absolute;left:9px;top:50%;transform:translateY(-50%)}
@@ -2605,7 +2957,75 @@ body.model-arriving .model,body.model-arriving .pad{opacity:0}
    keeps its exact proportions, and the canvases gain resolution rather than
    losing it. */
 #fit{flex:none;position:relative}
-#left{width:var(--w);transform-origin:top left}
+#left{width:392px;transform-origin:top left}   /* CALC_W: var(--w) lives on #calc only, so this was auto and got scaled twice */
+
+/* ---- teaching: type a program in, key by key */
+.key.next,.replay b.next{animation:knext 1s ease-in-out infinite}
+.key.next{outline:3px solid #4fc3f7;outline-offset:2px}
+.replay b.next::before{filter:drop-shadow(0 0 4px #4fc3f7)}
+@keyframes knext{0%,100%{outline-color:#4fc3f7}50%{outline-color:#4fc3f700}}
+.key.wrong{animation:kwrong .35s}
+@keyframes kwrong{0%,100%{transform:none}25%{transform:translateX(-3px)}75%{transform:translateX(3px)}}
+#teach{display:none;flex-direction:column;gap:10px;color:#cfd5dd;font:14px/1.4 "PingFang HK",Arial,sans-serif}
+body.teaching #teach{display:flex}
+#teach .thead{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+#teach .thead b{color:#f2b134;font-size:15px;margin-right:auto}
+#teach button{min-height:40px;padding:0 14px;border-radius:8px;border:1px solid #454d59;background:#333a44;color:#fff;font:600 14px Arial;cursor:pointer}
+#teach button.go{background:#3d8b5f;border-color:#3d8b5f}
+#teach .tgrid{display:flex;flex-wrap:wrap;gap:4px;max-height:40vh;overflow:auto}
+#teach .tc{min-width:30px;padding:3px 6px;border-radius:6px;background:#2a2f37;border:1px solid #3c434e;text-align:center;
+ font:600 15px/1.2 "SF Mono",Menlo,monospace;color:#e8ecf1}
+#teach .tc small{display:block;font:10px/1 Arial;color:#7d8590}
+#teach .tc.done{opacity:.35}
+#teach .tc.now{background:#4fc3f7;border-color:#4fc3f7;color:#0b1a22}
+#teach .tc.now small{color:#0b1a22}
+#teach .tc.setup{border-style:dashed}
+#teach .tnow{display:flex;gap:6px;align-items:center;flex-wrap:wrap;font-size:15px}
+#teach .tnow .kc.cur{outline:3px solid #4fc3f7;outline-offset:1px}
+#teach .tnow .kc.past{opacity:.4}
+#teach .tmsg{color:#9fd3b0;min-height:1.3em}
+body.klog-strip #teach .tgrid{display:none}
+
+/* ---- lesson view: a teacher projects this, students copy on their own machine.
+   Two things they cannot see from the back of a room: WHICH key was pressed, and
+   the keys that went before it. So every tap lights its key for a moment, and
+   the key log writes the sequence out as key faces — the same way Nixon's books
+   print an Input column. */
+.key.hit,.replay b.hit::before{animation:khit .45s ease-out}
+.key.hit{box-shadow:0 0 0 3px #ffd54a,0 0 16px 5px #ffd54acc}
+@keyframes khit{0%{filter:brightness(1.6)}100%{filter:none}}
+#klog{display:flex;flex-direction:column;gap:8px;min-width:0;color:#8b9098;font:12px/1.4 Arial}
+#klog .krow{display:flex;flex-wrap:wrap;gap:6px;align-items:center;transition:opacity .3s}
+#klog .krow.old{opacity:.38}
+#klog .kempty{color:#5d646e}
+.kc{display:inline-flex;align-items:center;justify-content:center;min-width:34px;height:26px;padding:0 8px;
+ border-radius:7px;font:700 14px/1 Arial;color:#f2f4f6;white-space:nowrap;
+ background:linear-gradient(#565e69,#2c323a);box-shadow:0 2px 0 #0f1114}
+.kc.num{background:linear-gradient(#33383f,#15181c)}
+.kc .kn{font:700 .62em/1 Arial;font-style:normal;margin-left:4px;opacity:.85}
+.kc.red{color:#ef5350}
+.kc.orange{background:linear-gradient(#ffa64d,#dd6d0d);color:#fff}
+.kc.oval{background:linear-gradient(#c3c7cc,#8b9098);color:#20242a;box-shadow:0 2px 0 #4e535a}
+.kc.sh{background:#b3781a;color:#fff;box-shadow:0 2px 0 #6e4a10}
+.kc.al{background:#c0303c;color:#fff;box-shadow:0 2px 0 #741c24}
+.kc.arrow{background:linear-gradient(#c9cdd2,#868b93);color:#3f444b;box-shadow:0 2px 0 #4b5057}
+/* Beside the machine when there is room for it (a whole projected screen);
+   a strip across the top when there is not (Split View beside a textbook). */
+#side{display:flex;flex-direction:column;gap:18px;min-width:0}
+#big{display:none;position:relative;overflow:hidden}
+#big>.lcd{position:absolute;left:0;top:0;margin:0;transform-origin:0 0}
+body.klog-side.big-on #big{display:block}
+body.klog-side #side{width:var(--klog-w,300px);padding-top:6px}
+body.klog-side #klog{gap:12px}
+body.klog-side #klog .krow{gap:8px}
+body.klog-side #klog .kc{font-size:calc(20px * var(--klog-k,1));height:calc(38px * var(--klog-k,1));
+ min-width:calc(46px * var(--klog-k,1));padding:0 calc(11px * var(--klog-k,1));border-radius:9px}
+body.klog-strip #wrap{flex-direction:column;align-items:center;flex-wrap:nowrap}
+body.klog-strip #side{order:-1;width:100%}
+body.klog-strip #klog{width:100%;flex-direction:row;overflow:hidden;justify-content:flex-end;height:30px}
+body.klog-strip #klog .krow{flex-wrap:nowrap}
+body.klog-strip #klog .krow.old{display:none}
+body.klog-strip #klog .krow.old:nth-last-child(2){display:flex}
 
 /* ---- program editor (computer side) ---- */
 #wrap{display:flex;gap:22px;align-items:flex-start;flex-wrap:wrap;justify-content:center}
@@ -2696,16 +3116,18 @@ const S = {
   // The real machine's factory setting is a b/c, but Nixon teaches in d/c and
   // his colleagues will never open SETUP — so ours ships in d/c, the same way
   // it ships with his four programs. SHIFT a b/c still swaps the two forms.
-  ctx: new Ctx({ frac: 'd/c' }),
+  ctx: new Ctx({ frac: 'ab/c' }),
   mode: 'COMP',
   result: null, error: null, showing: 'input',
   menu: null, pending: null,
   hist: [], hidx: -1, endStmt: '', endTag: '',
-  engExp: 0, asFrac: null, asDms: false, showIm: false, errPos: null,
+  engExp: null, asFrac: null, asDms: false, showIm: false, errPos: null,
   note: '',
   progs: ['', '', '', ''], pmodes: ['COMP', 'COMP', 'COMP', 'COMP'], psel: 0, run: null,
   fmla: null,                      // the FMLA "Formula No.?" chooser, when open
   off: null,                       // SHIFT AC: 'bye' for the farewell, then 'dark'
+  pedit: null,                     // editing a program on the glass: { slot, last }
+  teach: null,                     // 教學：入程式 — the key-by-key walkthrough
 };
 
 // ------------------------------------------------------------ program store
@@ -2816,23 +3238,379 @@ const CALC_W = 392;                    // the machine's own width, never changes
  *  proportions instead of reflowing. Nixon, 2026-09-22, from an iPad in Split
  *  View: "when it turn off the whole cal looks thinner... when the number was
  *  long decimal the cal goes fatter too, or it somewhat zoom it itself". */
+//
+// 2026-11-09, lesson view: the machine now also fits the window's HEIGHT and
+// grows past its own size, because a teacher projects it onto a whole board.
+// Where the window is wide enough the key log sits beside it; where it is not
+// (an iPad in Split View next to a textbook) the log is a strip on top. No
+// setting decides this — only the shape of the window.
+let ZOOM = 1;
+const ZOOM_MAX = 2.5;
+const KLOG_MIN = 220, KLOG_MAX = 760, KLOG_GAP = 22, STRIP_H = 56;
+// One body at a time. A link can name one (?skin=classic) for a colleague;
+// otherwise the teacher's last pick, otherwise ours.
+function applySkin(id, save) {
+  const sk = skinById(id);
+  S.skin = sk.id;
+  const body = document.body && document.body.classList;
+  if (body) { for (const s of SKINS) body.remove('skin-' + s.id); body.add('skin-' + sk.id); }
+  if (save) { try { localStorage.setItem(SKIN_LS, sk.id); } catch { /* private mode */ } }
+  const pick = document.getElementById('skinpick');
+  if (pick && pick.children) for (const b of pick.children) {
+    if (!b.dataset || !b.dataset.skin) continue;
+    b.classList.toggle('on', b.dataset.skin === sk.id);
+    b.setAttribute('aria-pressed', String(b.dataset.skin === sk.id));
+  }
+  if (save) fitWidth();
+}
+function initialSkin() {
+  try { const q = new URLSearchParams(location.search).get('skin'); if (q && SKINS.some(s => s.id === q)) return q; } catch { /* no URL */ }
+  try { const v = localStorage.getItem(SKIN_LS); if (v && SKINS.some(s => s.id === v)) return v; } catch { /* private mode */ }
+  return SKIN_DEFAULT;
+}
+
 function fitWidth() {
   const fit = document.getElementById('fit');
   const left = document.getElementById('left');
   if (!fit || !left || !fit.style || !left.style) return;      // test DOM shim
   left.style.transform = '';
   fit.style.width = ''; fit.style.height = '';
-  const room = (document.documentElement && document.documentElement.clientWidth || 0) - 32;
-  if (!(room > 0) || room >= CALC_W) return;
-  const k = room / CALC_W;
-  left.style.transform = `scale(${k})`;
-  fit.style.width = `${CALC_W * k}px`;
-  fit.style.height = `${(left.offsetHeight || 0) * k}px`;
+  const de = document.documentElement || {};
+  const W = (de.clientWidth || 0) - 32;
+  const H = (window.innerHeight || de.clientHeight || 0) - 32;
+  const natH = left.offsetHeight || 0;
+  if (!(W > 0) || !(H > 0) || !(natH > 0)) return;
+  const body = document.body.classList;
+  const editorOn = document.getElementById('editor')?.classList.contains('on');
+  let k, side = false;
+  if (editorOn) {
+    // The program editor is a computer-side tool; leave the machine its own
+    // size beside it and only shrink when the window is too narrow.
+    k = Math.min(1, W / CALC_W);
+  } else {
+    const kFull = Math.min(H / natH, ZOOM_MAX);
+    if (W >= CALC_W * kFull + KLOG_GAP + KLOG_MIN) { k = kFull; side = true; }
+    else k = Math.min(W / CALC_W, (H - STRIP_H) / natH, ZOOM_MAX);
+  }
+  body.toggle('klog-side', side);
+  body.toggle('klog-strip', !side && !editorOn);
+  const panel = document.getElementById('side');
+  const lcd = document.getElementById('lcd');
+  BIG_K = 0;
+  if (panel && panel.style && side) {
+    const kw = Math.min(KLOG_MAX, W - CALC_W * k - KLOG_GAP);
+    panel.style.setProperty('--klog-w', `${kw}px`);
+    panel.style.setProperty('--klog-k', String(Math.max(1, Math.min(1.8, k))));
+    // Only worth showing when it is clearly bigger than the machine's own
+    // glass — otherwise it is just a second copy taking the log's room.
+    const lw = lcd && lcd.offsetWidth;
+    if (lw > 0 && kw / lw >= k * 1.25) BIG_K = kw / lw;
+  }
+  body.toggle('big-on', BIG_K > 0);
+  if (Math.abs(k - 1) > 0.001) {
+    left.style.transform = `scale(${k})`;
+    fit.style.width = `${CALC_W * k}px`;
+    fit.style.height = `${natH * k}px`;
+  }
+  const changed = Math.abs(k - ZOOM) > 0.001;
+  ZOOM = k;
+  // Grown past its own size, the two canvases need more pixels or the dots
+  // and segments go soft on a projector.
+  if ((changed && k > 1) || BIG_K > 0) render();
+}
+
+/** Backing-store scale for the glass canvases: the screen's own density, and
+ *  more again when the machine is drawn larger than life. */
+function canvasScale() {
+  return (window.devicePixelRatio || 1) * Math.max(1, ZOOM);
+}
+
+// ---------------------------------------------------------------- key log
+const KLOG_ROWS = 4;
+const ARROWS = { UP: '▲', DOWN: '▼', LEFT: '◀', RIGHT: '▶' };
+let klogRows = [[]];
+// One entry per logged key: the machine's state just before it, and the log as
+// it was. A key that brings the machine back to an earlier state undoes the
+// keys in between — MODE MODE MODE, SHIFT SHIFT, 5 DEL — so they vanish from
+// the record instead of piling up (Nixon, 2026-11-11: "strokes that not
+// effecting shd no record at all"; CalcX has the DEL half of this as an option).
+let klogUndo = [];
+const KLOG_UNDO = 24;
+const bigJson = v => JSON.stringify(v, (k, x) => typeof x === 'bigint' ? x.toString() : x);
+/** Everything a key can change that a student could see or that matters later. */
+function machineState() {
+  const m = S.menu;
+  return bigJson([S.off, S.mode, S.toks.map(t => t.e), S.cur, S.ins, S.showing, S.error,
+    m && [m.l1, m.l2, m.page], S.sub && S.sub.kind, S.shift, S.alpha, S.hyp, S.pending,
+    S.hidx, S.hist.length, S.result && S.result.text, S.asFrac, S.asDms, S.engExp, S.showIm,
+    S.run && [S.run.mode, S.run.label, S.run.srcText, S.run.res && S.run.res.text],
+    S.pedit && S.pedit.slot, S.progs, S.pmodes, S.fmla, S.contrast,
+    S.ctx.mode, S.ctx.angle, S.ctx.disp, S.ctx.frac, S.ctx.cplx, S.ctx.vars, S.ctx.stat]);
+}
+
+/** The face of a physical key as a student would look for it on their own
+ *  machine: the key cap's text, or the label printed above a blank oval key. */
+function keyFace(id) {
+  if (ARROWS[id]) return { text: ARROWS[id] + '︎', cls: 'arrow' };
+  const k = KEYMAP[id];
+  if (!k) return null;
+  if (id === 'SHIFT') return { text: 'SHIFT', cls: 'sh' };
+  if (id === 'ALPHA') return { text: 'ALPHA', cls: 'al' };
+  const text = k.k || (k.above && k.above[0] && k.above[0][0]) || id;
+  const c = (k.cls || 'fn').split(' ');
+  const cls = ['num', 'red', 'orange', 'oval'].filter(x => c.includes(x)).join(' ');
+  return { text, cls };
+}
+
+function clearKlog() { klogRows = [[]]; klogUndo = []; drawKlog(); }
+function logKey(id) {
+  if (S.off && id !== 'ON') return;               // a dead keypad logs nothing
+  const face = keyFace(id);
+  if (!face) return;
+  let row = klogRows[klogRows.length - 1];
+  // AC and ON begin a fresh line of keys; EXE closes one.
+  // (SHIFT AC is OFF, one action — keep the pair together.)
+  const afterShift = row.length && row[row.length - 1].text === 'SHIFT';
+  if ((id === 'AC' || id === 'ON') && row.length && !afterShift) { row = []; klogRows.push(row); }
+  // Walking the cursor along a program is dozens of the same arrow in a row;
+  // one chip with a count reads better than a wall of them (Nixon, 2026-11-10).
+  // The same key again is one chip with a count: MODE ×3, ) ×8, ▶ ×20.
+  const last = row[row.length - 1];
+  if (last && last.id === id) last.n = (last.n || 1) + 1;
+  else row.push({ ...face, id });
+  if (id === 'EXE') klogRows.push([]);
+  while (klogRows.length > KLOG_ROWS + 1) klogRows.shift();
+  drawKlog();
+}
+
+function drawKlog() {
+  const el = document.getElementById('klog');
+  if (!el) return;
+  const rows = klogRows.filter((r, i) => r.length || i === klogRows.length - 1);
+  const last = rows.length - 1;
+  // The line being typed is bright; straight after EXE that is the line just
+  // finished. Everything before it fades.
+  const live = rows[last].length || last === 0 ? last : last - 1;
+  el.innerHTML = rows.map((r, i) => {
+    const chips = r.map(f => `<span class="kc ${f.cls}">${escHtml(f.text)}${f.n > 1 ? `<i class="kn">×${f.n}</i>` : ''}</span>`).join('');
+    const body = chips || (i === 0 ? '<span class="kempty">按鍵記錄</span>' : '');
+    return `<div class="krow${i < live ? ' old' : ''}">${body}</div>`;
+  }).join('');
+}
+
+function escHtml(s) {
+  return String(s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+}
+
+/** Light the key that was just pressed, for long enough to be seen across a
+ *  classroom. Restarting the animation lets a quick double tap flash twice. */
+function flashKey(id) {
+  const sel = ARROWS[id] ? `.replay b[data-k="${id}"]` : `.key[data-id="${id}"]`;
+  const el = document.querySelector && document.querySelector(sel);
+  if (!el || !el.classList) return;
+  el.classList.remove('hit');
+  void el.offsetWidth;
+  el.classList.add('hit');
+  clearTimeout(el._hitT);
+  el._hitT = setTimeout(() => el.classList.remove('hit'), 450);
+}
+
+// ---------------------------------------------------------------- feedback
+// Testers are Nixon's friends and colleagues. No server: the note goes out
+// through the device's own share sheet (WhatsApp, Messages, Mail…), straight
+// to him, with the facts a bug report needs already attached.
+function feedbackContext() {
+  const l1 = document.getElementById('l1'), l2 = document.getElementById('l2');
+  const lastKeys = (klogRows.filter(r => r.length).slice(-2)).map(r => r.map(f => f.text + (f.n > 1 ? '×' + f.n : '')).join(' ')).join(' / ');
+  const ua = navigator.userAgent || '';
+  const dev = /iPad|Macintosh.*Mobile|Macintosh.*Safari/.test(ua) && navigator.maxTouchPoints > 1 ? 'iPad'
+    : /iPhone/.test(ua) ? 'iPhone' : /Android/.test(ua) ? 'Android' : /Mac/.test(ua) ? 'Mac' : /Windows/.test(ua) ? 'Windows' : 'other';
+  return [
+    `${MODEL_NAME} 模擬器 v${VERSION}（${BUILD_DATE}）`,
+    `機：${dev}　畫面：${window.innerWidth}×${window.innerHeight}　模式：${S.mode}`,
+    `螢幕：${(l1 && l1.textContent) || ''} ｜ ${(l2 && l2.dataset && l2.dataset.raw) || ''}`,
+    lastKeys ? `最後撳嘅掣：${lastKeys}` : '',
+  ].filter(Boolean).join('\n');
+}
+function openFeedback() {
+  let fb = document.getElementById('fb');
+  if (!fb) {
+    fb = document.createElement('div'); fb.id = 'fb';
+    fb.innerHTML = `<div class="box" role="dialog" aria-modal="true" aria-labelledby="fb-h">
+      <h3 id="fb-h">意見／報 bug</h3>
+      <p>寫低你見到咩、想要咩。版本、部機同最後撳嘅掣會自動附上。</p>
+      <textarea id="fb-text" placeholder="例如：投影出嚟個 LCD 太細／撳咗 SHIFT sin 冇反應…"></textarea>
+      <div class="acts"><button class="go" id="fb-send">傳送</button><button id="fb-copy">複製</button><button id="fb-close">關閉</button></div>
+      <div class="done" id="fb-done" role="status"></div></div>`;
+    document.body.appendChild(fb);
+    const msg = () => `${document.getElementById('fb-text').value.trim()}\n\n— — —\n${feedbackContext()}`;
+    const done = t => { document.getElementById('fb-done').textContent = t; };
+    fb.querySelector('#fb-close').onclick = () => fb.classList.remove('on');
+    fb.onclick = e => { if (e.target === fb) fb.classList.remove('on'); };
+    fb.querySelector('#fb-copy').onclick = async () => {
+      try { await navigator.clipboard.writeText(msg()); done('已複製，貼去 WhatsApp 畀 Nixon 就得。'); }
+      catch { const t = document.getElementById('fb-text'); t.value = msg(); t.select(); done('揀咗全部文字，請自己複製。'); }
+    };
+    fb.querySelector('#fb-send').onclick = async () => {
+      const text = msg();
+      if (navigator.share) {
+        try { await navigator.share({ title: 'fx 模擬器意見', text }); done('多謝！'); return; }
+        catch (e) { if (e && e.name === 'AbortError') return; }
+      }
+      window.open('https://wa.me/?text=' + encodeURIComponent(text), '_blank', 'noopener');
+      done('喺 WhatsApp 揀 Nixon 再傳送。');
+    };
+    // Typing in the box must not press calculator keys.
+    fb.addEventListener('keydown', e => e.stopPropagation());
+  }
+  document.getElementById('fb-done').textContent = '';
+  fb.classList.add('on');
+  setTimeout(() => document.getElementById('fb-text').focus(), 50);
+}
+
+/** A key pressed by a person (screen or keyboard), as opposed to one the code
+ *  presses for itself: it is logged and lit, then it does what it does. */
+function tap(id) {
+  if (S.teach && !teachAccepts(id)) return;
+  flashKey(id);
+  const before = machineState(), rowsBefore = klogRows.map(r => r.map(c => ({ ...c })));
+  press(id);
+  if (!S.teach) {
+    const after = machineState();
+    if (after === before) return;                       // changed nothing: not worth a chip
+    const back = klogUndo.findIndex(u => u.state === after);
+    if (back >= 0) {                                    // undid the keys since then: drop them all
+      klogRows = klogUndo[back].rows; klogUndo.length = back; drawKlog(); return;
+    }
+    klogUndo.push({ state: before, rows: rowsBefore });
+    if (klogUndo.length > KLOG_UNDO) klogUndo.shift();
+    // A finished calculation is history: nothing after EXE may erase it
+    // (the 15-entry history stops growing, so states can repeat).
+    if (id === 'EXE') klogUndo = [];
+  }
+  logKey(id);
+  if (S.teach) teachAdvance();
+}
+
+// ---------------------------------------------------------------- teaching
+// "教學：入程式": the calculator walks the class through typing a program in,
+// one key at a time — MODE 6, EDIT, the slot, the mode, then every byte with
+// the keys that make it (keyseq.mjs). The key to press next pulses; the
+// teacher presses it (or 下一步 / 自動 presses it for them); a wrong key only
+// shakes. The sequences are the ones the test suite proves by typing every
+// program in Nixon's book. What dse.best and the CodeBook code sheet print as a
+// static table, this does live on the glass.
+function teachSteps(slot) {
+  const mode = S.pmodes[slot] === 'CMPLX' ? 'CMPLX' : 'COMP';
+  const setup = [
+    { label: 'MODE', keys: ['MODE'] }, { label: '6', keys: ['D6'], note: 'PRGM' },
+    { label: '1', keys: ['D1'], note: 'EDIT' }, { label: String(slot + 1), keys: ['D' + (slot + 1)], note: 'P' + (slot + 1) },
+    { label: mode === 'CMPLX' ? '2' : '1', keys: [mode === 'CMPLX' ? 'D2' : 'D1'], note: mode },
+  ].map(x => ({ ...x, setup: true }));
+  const body = programKeys(S.teach.src, mode).map(st => ({ label: st.tok, keys: st.keys }));
+  return [...setup, ...body, { label: 'ON', keys: ['ON'], setup: true, note: '完成' }];
+}
+function startTeach(slot) {
+  if (S.teach) stopTeach(true);
+  if (IS_3650) { S.note = '3650 未有教學模式'; return render(); }
+  const src = S.progs[slot] || '';
+  if (!src.trim()) { S.note = `P${slot + 1} 係空`; return render(); }
+  S.teach = { slot, src, mode: S.pmodes[slot], i: 0, k: 0, timer: null, msg: '' };
+  S.teach.steps = teachSteps(slot);
+  const unknown = S.teach.steps.filter(st => !st.keys);
+  if (unknown.length) {
+    const what = unknown.map(st => st.label).join(' ');
+    S.teach = null; S.note = '未識撳：' + what; return render();
+  }
+  // Clear the stage: out of any menu or edit, an empty slot to type into.
+  if (S.run) endRun();
+  S.menu = null; S.pedit = null; S.fmla = null; S.mode = 'COMP'; S.ctx.mode = 'COMP';
+  newInput(false); S.shift = false; S.alpha = false;
+  S.progs[slot] = ''; saveProgs();
+  klogRows = [[]]; klogUndo = []; drawKlog();
+  document.body.classList.add('teaching');
+  fitWidth(); render(); paintTeach();
+}
+const teachExpected = () => { const t = S.teach, st = t && t.steps[t.i]; return st ? st.keys[t.k] : null; };
+function teachAccepts(id) {
+  const want = teachExpected();
+  if (!want || id === want) return true;
+  const el = document.querySelector && document.querySelector(`.key[data-id="${id}"]`);
+  if (el && el.classList) { el.classList.remove('wrong'); void el.offsetWidth; el.classList.add('wrong'); }
+  S.teach.msg = '撳呢粒：' + ((keyFace(want) || {}).text || want);
+  paintTeach();
+  return false;
+}
+function teachAdvance() {
+  const t = S.teach;
+  t.msg = '';
+  if (++t.k >= t.steps[t.i].keys.length) { t.i++; t.k = 0; }
+  if (t.i >= t.steps.length) {
+    const ok = byteCount(S.progs[t.slot] || '') === byteCount(t.src)
+      && normalize(S.progs[t.slot] || '').replace(/ᴇ/g, 'E') === normalize(t.src.replace(/\n/g, ':')).replace(/ᴇ/g, 'E');
+    if (!ok) { S.progs[t.slot] = t.src; saveProgs(); }
+    t.done = true; t.msg = ok ? `完成！P${t.slot + 1} 入好咗（${byteCount(t.src)} bytes）。` : '入出嚟同原本唔同，已還原原本程式。';
+    clearInterval(t.timer); t.timer = null;
+  }
+  paintTeach();
+}
+function stopTeach(silent) {
+  const t = S.teach;
+  if (!t) return;
+  clearInterval(t.timer);
+  // Stopped half way: put the original program back.
+  if (!t.done) { S.progs[t.slot] = t.src; S.pmodes[t.slot] = t.mode; saveProgs(); if (S.pedit) leavePrgm(); S.menu = null; }
+  S.teach = null;
+  document.body.classList.remove('teaching');
+  document.querySelectorAll && document.querySelectorAll('.next').forEach(e => e.classList.remove('next'));
+  if (!silent) { fitWidth(); render(); }
+}
+function teachStep() { const id = teachExpected(); if (id) tap(id); }
+function teachAuto() {
+  const t = S.teach; if (!t) return;
+  if (t.timer) { clearInterval(t.timer); t.timer = null; return paintTeach(); }
+  t.timer = setInterval(() => { if (!S.teach || S.teach.done) return; teachStep(); }, 650);
+  paintTeach();
+}
+function paintTeach() {
+  const box = document.getElementById('teach');
+  if (!box || !document.querySelectorAll || !document.querySelector) return;   // test DOM shim
+  document.querySelectorAll('.next').forEach(e => e.classList.remove('next'));
+  const t = S.teach;
+  if (!t) { box.innerHTML = ''; return; }
+  const want = teachExpected();
+  if (want) {
+    const sel = ARROWS[want] ? `.replay b[data-k="${want}"]` : `.key[data-id="${want}"]`;
+    const el = document.querySelector(sel); if (el) el.classList.add('next');
+  }
+  const cur = t.steps[t.i];
+  let n = 0;
+  const grid = t.steps.map((st, i) => {
+    const num = st.setup ? (st.note || '') : String(++n).padStart(3, '0');
+    const cls = 'tc' + (st.setup ? ' setup' : '') + (i < t.i ? ' done' : i === t.i ? ' now' : '');
+    return `<span class="${cls}">${escHtml(st.label)}<small>${escHtml(num)}</small></span>`;
+  }).join('');
+  const keys = cur ? cur.keys.map((id, j) => {
+    const f = keyFace(id) || { text: id, cls: '' };
+    return `<span class="kc ${f.cls}${j < t.k ? ' past' : j === t.k ? ' cur' : ''}">${escHtml(f.text)}</span>`;
+  }).join('<span>→</span>') : '';
+  box.innerHTML = `<div class="thead"><b>教學：P${t.slot + 1} 入程式（${byteCount(t.src)} bytes）</b>
+      ${t.done ? '' : '<button class="go" id="tnext">下一步</button>'}
+      ${t.done ? '' : `<button id="tauto">${t.timer ? '暫停' : '自動'}</button>`}
+      <button id="tstop">${t.done ? '關閉' : '結束'}</button></div>
+    <div class="tnow">${cur ? `<b>${escHtml(cur.label)}</b>${cur.note ? `<small>（${escHtml(cur.note)}）</small>` : ''}：${keys}` : ''}</div>
+    <div class="tmsg">${escHtml(t.msg || '')}</div>
+    <div class="tgrid">${grid}</div>`;
+  if (!box.querySelector) return;
+  const on = (sel, f) => { const b = box.querySelector(sel); if (b) b.onclick = f; };
+  on('#tnext', teachStep); on('#tauto', teachAuto); on('#tstop', () => stopTeach(false));
+  const now = box.querySelector('.tc.now');
+  if (now && now.scrollIntoView) now.scrollIntoView({ block: 'nearest' });
 }
 
 // -------------------------------------------------------------------- DOM
 function buildDOM() {
-  const st = document.createElement('style'); st.textContent = CSS;
+  const st = document.createElement('style'); st.textContent = CSS + SKIN_CSS;
   document.head.appendChild(st);
   const app = document.getElementById('app') || document.body;
   const wrap = document.createElement('div'); wrap.id = 'wrap';
@@ -2848,7 +3626,7 @@ function buildDOM() {
     <div class="brandrow">
       <div>
         <div class="brand"></div>
-        <div class="model" id="model-switch" title="來回摩擦一秒切換機款">${IS_3650 ? 'fx-3650P' : 'fx-50FH'}<b>II</b></div>
+        <div class="model" id="model-switch" data-own="${IS_3650 ? 'NX-3650' : 'NX-50'}" title="來回摩擦一秒切換機款">${IS_3650 ? 'fx-3650P' : 'fx-50FH'}<b>II</b></div>
         <div class="hkeaa" id="approval-brand" aria-hidden="true"><u><i></i><i></i><i></i><i></i><i></i></u>N.I.X.O.N. Approved</div>
       </div>
       <div style="display:flex;flex-direction:column;align-items:flex-end;gap:5px">
@@ -2881,12 +3659,31 @@ function buildDOM() {
   const studio = document.createElement('button'); studio.id = 'studio-launch'; studio.className = 'studio-launch';
   studio.textContent = '程式工作室'; studio.setAttribute('aria-controls', 'editor'); studio.setAttribute('aria-expanded', 'false');
   studio.onclick = () => { openEditor(); document.getElementById('ptext').focus(); };
-  left.appendChild(studio);
+  const tools = document.createElement('div'); tools.className = 'tools-row';
+  tools.appendChild(studio);
+  const fbBtn = document.createElement('button'); fbBtn.className = 'studio-launch'; fbBtn.id = 'fb-open';
+  fbBtn.textContent = '意見'; fbBtn.onclick = openFeedback;
+  tools.appendChild(fbBtn);
+  left.appendChild(tools);
+  const pick = document.createElement('div'); pick.className = 'skinpick'; pick.id = 'skinpick';
+  pick.setAttribute('role', 'group'); pick.setAttribute('aria-label', '外觀');
+  const swatch = { nx: '#2a2d32', chalk: '#efe9de', board: '#ffffff', classic: '#c9ccd0' };
+  pick.appendChild(Object.assign(document.createElement('span'), { textContent: '外觀' }));
+  for (const sk of SKINS) {
+    const b = document.createElement('button'); b.dataset.skin = sk.id;
+    b.innerHTML = `<i style="background:${swatch[sk.id]}"></i>${sk.name}`;
+    b.onclick = () => applySkin(sk.id, true);
+    pick.appendChild(b);
+  }
+  left.appendChild(pick);
   const spoken = document.createElement('output'); spoken.id = 'lcd-accessible'; spoken.className = 'sr-only';
   spoken.setAttribute('aria-live', 'polite'); spoken.setAttribute('aria-atomic', 'true'); spoken.setAttribute('aria-label', '計數機顯示');
   left.appendChild(spoken);
   let keyboardNavigation = false;
   document.addEventListener('pointerdown', () => { keyboardNavigation = false; });
+  const side = document.createElement('div'); side.id = 'side';
+  side.innerHTML = '<div id="big" aria-hidden="true"></div><div id="teach"></div><div id="klog"></div>';
+  wrap.appendChild(side);
   buildEditor(wrap);
   bindModelRub(document.getElementById('model-switch'));
   bindSolarCover(document.getElementById('solar-brand-toggle'));
@@ -2905,8 +3702,8 @@ function buildDOM() {
         w.querySelectorAll('b').forEach(b => {
           b.style.touchAction = 'manipulation'; b.setAttribute('role','button'); b.setAttribute('tabindex','0');
           b.setAttribute('aria-label', 'REPLAY ' + ({UP:'上',DOWN:'下',LEFT:'左',RIGHT:'右'}[b.dataset.k]));
-          b.onclick = () => press(b.dataset.k);
-          b.onkeydown = e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); e.stopPropagation(); press(b.dataset.k); } };
+          b.onclick = () => tap(b.dataset.k);
+          b.onkeydown = e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); e.stopPropagation(); tap(b.dataset.k); } };
         });
         rd.appendChild(w);
         continue;
@@ -2933,10 +3730,10 @@ function buildDOM() {
       // twice, and self-clears so a keyboard-triggered click still works.
       let tapped = false;
       btn.addEventListener('pointerdown', () => {
-        tapped = true; press(k.id);
+        tapped = true; tap(k.id);
         setTimeout(() => { tapped = false; }, 500);
       });
-      btn.addEventListener('click', () => { if (!tapped) press(k.id); });
+      btn.addEventListener('click', () => { if (!tapped) tap(k.id); });
       cell.appendChild(ab); cell.appendChild(btn);
       rd.appendChild(cell);
     }
@@ -2950,7 +3747,7 @@ function buildDOM() {
     if (e.metaKey || e.ctrlKey) return;
     if (e.target && ['TEXTAREA','INPUT','SELECT'].includes(e.target.tagName)) return;
     const action = IS_3650 ? PHYS[e.key] : STANDARD_KEYS[standardChord(e)];
-    if (action) { e.preventDefault(); for (const id of action.split(' ')) press(id); }
+    if (action) { e.preventDefault(); for (const id of action.split(' ')) tap(id); }
   });
 }
 
@@ -3072,7 +3869,7 @@ function buildEditor(parent) {
   const ed = document.createElement('div'); ed.id = 'editor';
   ed.innerHTML = `
     <h3>程式工作室 · P1–P4 <button id="eclose" class="sec" aria-label="關閉程式工作室">關閉</button></h3>
-    <p><a href="${typeof location !== 'undefined' && (location.pathname || '').endsWith('/index.html') ? 'library.html' : 'fx50-library.html'}">開啟 Program Code Book／程式簿</a> · <a href="${typeof location !== 'undefined' && (location.pathname || '').endsWith('/index.html') ? 'dist/lp-n.html' : 'lp-n.html'}">LP · N 條約束</a></p>
+    <p><a href="${typeof location !== 'undefined' && (location.pathname || '').endsWith('/index.html') ? 'library.html' : 'fx50-library.html'}">開啟 Program Code Book／程式簿</a></p>
     <div id="eimport" class="emsg on info" hidden></div>
     <div class="etabs" id="etabs"></div>
     <div id="eguide" class="eguide"></div>
@@ -3085,6 +3882,7 @@ function buildEditor(parent) {
       <span class="cnt" id="ecnt"></span>
       <span style="flex:1"></span>
       <button id="erun">執行</button>
+      ${IS_3650 ? '' : '<button class="sec" id="eteach" title="喺計數機上逐粒掣示範點樣入呢條程式">教學：入程式</button>'}
       <button class="sec" id="eshow">編譯</button>
       <button class="sec" id="ecopy">複製</button>
       <button class="sec" id="eclr">清除</button>
@@ -3147,7 +3945,9 @@ function buildEditor(parent) {
     if (norm !== before) { ta.value = norm; ta.selectionStart = ta.selectionEnd = pos - (before.length - norm.length); }
     saveProgs(); updateCounts(); paintEditor();
   });
-  ed.querySelector('#erun').onclick = () => startRun(S.psel);
+  ed.querySelector('#erun').onclick = () => startRun(S.psel, true);
+  const teachBtn = ed.querySelector('#eteach');
+  if (teachBtn) teachBtn.onclick = () => { closeEditor(); startTeach(S.psel); };
   // shows exactly what the compiler made of your program — paste this when
   // something runs differently from the real machine
   ed.querySelector('#eshow').onclick = () => {
@@ -3231,7 +4031,7 @@ function prepareProgramImport(record, slot) {
   if (!record || typeof record.src !== 'string' || !record.src.trim()) throw new Error('程式是空白');
   if (!MODE_READY[record.mode]) throw new Error(`${record.mode} 模式尚未支援執行`);
   const src = normalize(record.src);
-  compile(src);
+  checkProgram(src);
   const total = S.progs.reduce((n, p, i) => n + byteCount(i === slot ? src : p || ''), 0);
   if (total > PROGRAM_BYTES) throw new Error(`總共 ${total} bytes，超出 ${MODEL_NAME} 的 ${PROGRAM_BYTES} bytes。請先備份，再自行騰出空間。`);
   return src;
@@ -3298,7 +4098,7 @@ function stageProgramImport(data) {
       const progs = records.map(p => normalize(p.src));
       records.forEach((p, i) => { if (progs[i].trim()) {
         if (!MODE_READY[p.mode]) throw new Error(`${p.mode} 模式尚未支援`);
-        compile(progs[i]);
+        checkProgram(progs[i]);
       } });
       if (progs.reduce((n, p) => n + byteCount(p), 0) > PROGRAM_BYTES) throw new Error('四區總容量超出限制');
       if (S.run) endRun();
@@ -3341,7 +4141,7 @@ function editorKey(id, sh, al) {
   }
   if (id === 'HYP') { S.hyp = sh ? 2 : 1; return true; }
   if ((id === 'SIN' || id === 'COS' || id === 'TAN') && S.hyp && !al) {
-    const t = HYP[id][S.hyp - 1]; S.hyp = 0; insertAtCursor(t); return true;
+    const t = HYP[id][S.hyp === 2 || sh ? 1 : 0]; S.hyp = 0; insertAtCursor(t); return true;
   }
   if (id === 'RCL' || id === 'ENG' || id === 'ANS' || id === 'MPLUS') {
     // STO arrow / i / Ans / M all have plain program spellings
@@ -3359,6 +4159,7 @@ function editorKey(id, sh, al) {
 
 function insertAtCursor(text, caretOffset) {
   if (!text) return;
+  if (S.pedit) { for (const t of byteTokens(text)) if (t !== '\n') ins(progTok(t)); return; }
   const ta = document.getElementById('ptext');
   const a = ta.selectionStart ?? ta.value.length, b = ta.selectionEnd ?? a;
   ta.value = ta.value.slice(0, a) + text + ta.value.slice(b);
@@ -3452,6 +4253,7 @@ function openEditor() {
   if (ed) ed.classList.add('on');
   document.getElementById('studio-launch')?.setAttribute('aria-expanded','true');
   syncEditor();
+  fitWidth();
 }
 function hideEditor() {
   const ed = document.getElementById('editor');
@@ -3460,6 +4262,7 @@ function hideEditor() {
   document.getElementById('studio-launch')?.setAttribute('aria-expanded','false');
   const ta = document.getElementById('ptext');
   if (ta && ta.blur) ta.blur();
+  fitWidth();
   return true;
 }
 function closeEditor() {
@@ -3470,12 +4273,19 @@ function closeEditor() {
 }
 
 // ------------------------------------------------------------- program run
-function startRun(idx) {
-  // run exactly what the box shows, even if an edit never fired an input event
+function startRun(idx, fromStudio = false) {
+  // The studio's Run button runs exactly what its box shows, even if an edit
+  // never fired an input event. A run from the keys never touches the store.
   const box = document.getElementById('ptext');
-  if (box && idx === S.psel && typeof box.value === 'string') S.progs[idx] = normalize(box.value);
+  if (fromStudio && box && idx === S.psel && typeof box.value === 'string') S.progs[idx] = normalize(box.value);
   const src = S.progs[idx];
-  if (!src || !src.trim()) { S.note = `P${idx + 1} 係空`; return render(); }
+  if (!src || !src.trim()) {
+    // Nixon, 2026-11-11: an empty area just drops back to ordinary calculation.
+    S.menu = null;
+    if (S.mode === 'PRGM') S.mode = S.ctx.mode = 'COMP';
+    newInput(false); S.error = null; S.result = null;
+    return render();
+  }
   const pm = S.pmodes[idx] || 'COMP';
   if (!MODE_READY[pm]) { S.note = `${pm} 模式未做`; return render(); }
   // hand the keyboard back to the calculator, otherwise typed answers go to the editor
@@ -3584,7 +4394,7 @@ function stepRun(sendValue) {
       S.toks = []; S.cur = 0;
       // stays on the upper line beside the answer: the last statement for a
       // program, the answer's own name for a formula
-      S.endStmt = endText || S.ctx.lastStmt || '';
+      S.endStmt = endText || progLine(S.ctx.lastStmt || '');
       S.endTag = endTag || '';
       S.result = v ? fmtResult(v, S.ctx) : null;
       S.showIm = !!(S.result && S.result.imFirst);
@@ -3620,7 +4430,7 @@ function stepRun(sendValue) {
       // machine still lets you press SHIFT Re⇔Im to read the imaginary half.
       S.run.res = fmtResult(r.value.value, S.ctx, { noFrac: true });
       S.run.showIm = !!S.run.res.imFirst;
-      S.run.srcText = r.value.text || '';        // shown on the upper line
+      S.run.srcText = S.run.fmla ? (r.value.text || '') : progLine(r.value.text || '');   // shown on the upper line
     }
   } catch (e) {
     endRun(); S.error = e.kind || 'Math ERROR'; S.showing = 'result';
@@ -3634,7 +4444,7 @@ function stepRun(sendValue) {
 function progError(e, idx, phase) {
   const kind = e.kind || 'Syntax ERROR';
   const at = e.progPos ?? e.pos ?? null;
-  S.progErrAt = at;
+  S.progErrAt = at; S.progErrSlot = idx;
   const src = S.progs[idx] || '';
   let msg = `P${idx + 1} ${phase}：${kind}`;
   if (at != null && at <= src.length) {
@@ -3678,7 +4488,8 @@ const imShowing = () => (S.run && S.run.mode === 'disp') ? S.run.showIm : S.show
 
 /** Which program area the P1–P4 boxes point at: the one running, or the one
  *  the Prog menu is sitting on. */
-const progArea = () => S.run ? S.runIdx : ((S.menu && S.menu.prog) ? S.psel : null);
+const progArea = () => S.run ? S.runIdx : S.pedit ? S.pedit.slot
+  : ((S.menu && S.menu.prog) ? S.psel : null);
 
 // The exact indicator set, in the machine's own order, read off the self-test's
 // all-segments-on pattern (2026-08-09 21:05 recording, SHIFT 7 ON). The ones
@@ -3699,10 +4510,10 @@ const SYMS = [
   ['hyp', () => S.hyp !== 0], ['M', () => memoryLit()],
   ['STO', () => S.pending === 'sto'], ['RCL', () => S.pending === 'rcl'],
   ['SD', () => S.mode === 'SD'], ['REG', () => S.mode === 'REG'],
-  ['CMPLX', () => S.mode === 'CMPLX'],
+  ['CMPLX', () => S.mode === 'CMPLX' || !!(S.pedit && S.pmodes[S.pedit.slot] === 'CMPLX')],
   // A built-in formula is not a program area, so PRGM stays dark for it
   // (⚠️ assumed, not checked on the machine).
-  ['PRGM', () => !!(S.run && !S.run.fmla) || !!(S.menu && S.menu.prog)],
+  ['PRGM', () => !!(S.run && !S.run.fmla) || !!(S.menu && S.menu.prog) || (S.mode === 'PRGM' && !S.run)],
   ['P1', () => progArea() === 0, 'box'], ['P2', () => progArea() === 1, 'box'],
   ['P3', () => progArea() === 2, 'box'], ['P4', () => progArea() === 3, 'box'],
   ['D', () => S.ctx.angle === 'deg', 'box'],
@@ -3710,13 +4521,16 @@ const SYMS = [
   ['G', () => S.ctx.angle === 'gra', 'box'],
   ['FIX', () => S.ctx.disp.disp === 'fix'], ['SCI', () => S.ctx.disp.disp === 'sci'],
   ['r∠θ', () => S.ctx.cplx === 'r∠θ'],
-  ['R⇔I', () => cxShowing() !== null],
+  // a pure imaginary answer (9.i) has nothing to switch to: the book's
+  // Function-02 Ex 2(b) photo shows 9.i with R⇔I off
+  ['R⇔I', () => { const r = cxShowing(); return !!r && !r.imFirst; }],
 ];
 
 /** The small label at the bottom-left of the digit line: `a?` while a value is
  *  being asked for, `x=` beside a built-in formula's answer. On the glass it is
  *  one dot cell plus a fixed ? or = segment (REAL: the all-segments photo). */
 function lowerTag() {
+  if (S.menu) return '';
   if (S.run && S.run.mode === 'input') return `${S.run.label}?`;
   if (S.run && S.run.mode === 'disp') return S.run.dispTag || '';
   if (S.showing === 'result' && S.endTag) return S.endTag;
@@ -3758,6 +4572,9 @@ function line1() {
  *  never gets one, and an exponent keeps its own mantissa point. This is a
  *  display rule only — dataset.raw keeps the plain text for tests. */
 function withPoint(s) {
+  // a sexagesimal answer keeps the point lit after its seconds: 1°40°0.
+  // (book photos, Function-06)
+  if (s && s.includes('°') && !s.includes('」')) return /\.\d*$/.test(s.slice(s.lastIndexOf('°'))) ? s : s + '.';
   if (!s || /[」°]/.test(s)) return s;
   const i = s.indexOf('×10^');
   const mant = i < 0 ? s : s.slice(0, i);
@@ -3768,6 +4585,7 @@ function withPoint(s) {
 function resultText() {
   if (S.error) return '';        // the message is on the upper line
   if (S.menu) return S.menu.l2;
+  if (S.pedit) return String(byteCount(peditSource())).padStart(3, '0');
   if (S.fmla) return S.fmla.typed;
   if (S.run && S.run.mode === 'input') {
     // "A?" sits on the left of this same line, and the right keeps showing the
@@ -3790,10 +4608,14 @@ function resultText() {
     return S.run.res.type === 'cx'
       ? (S.run.showIm ? S.run.res.text2 : S.run.res.text) : S.run.res.text;
   }
+  if (S.blankL2 && S.showing === 'result') return '----------';   // Data Clear! (Nixon, 2026-11-11)
   if (!S.result) return '0';
   const r = S.result;
   const part = r.type === 'cx' ? (S.showIm ? r.value.im : r.value.re) : r.value;
-  if (S.asDms && r.type !== 'cx') { const t = toDms(r.value); return `${t.neg ? '-' : ''}${t.deg}°${t.min}°${t.sec}`; }
+  // °'" switches between the two forms both ways: an answer that came out in
+  // degrees-minutes-seconds goes to a decimal and back (Function-06, point 3)
+  if (r.type !== 'cx' && S.asFrac === null && (r.type === 'dms') !== S.asDms) { const t = toDms(r.value); return `${t.neg ? '-' : ''}${t.deg}°${t.min}°${t.sec}`; }
+  if (r.type === 'dms' && S.asFrac === null) return format(r.value, S.ctx.disp).mant;
   if (S.asFrac === 'dec') return format(part, S.ctx.disp).mant;
   if (S.asFrac !== null) {
     const f = toFraction(part, S.asFrac);
@@ -3801,7 +4623,7 @@ function resultText() {
     return format(part, S.ctx.disp).mant;
   }
   if (r.type === 'cx') return S.showIm ? r.text2 : r.text;
-  if (S.engExp) { const g = formatEng(r.value, S.engExp); return `${g.mant}ᴇ${g.exp}`; }
+  if (S.engExp !== null && r.value && r.value.m !== undefined) { const g = formatEng(r.value, S.engExp); return `${g.mant}×10^${g.exp}`; }
   return r.text;
 }
 
@@ -3830,9 +4652,11 @@ const GHOST = '#141a1210';
 // grid. Five dots at the 3.2 pitch make the cell 16px across, so the seven rows
 // have to cover 32 — the dots are about half again as tall as they are wide.
 // Square dots gave 1:1.4, which is why the line looked squat.
-const PITCH_X = 3.2, PITCH_Y = 32 / 7;
-const DOT_X = 2.9, DOT_Y = 4.3;
-let lastDots = null, blinkOn = true, blinkTimer = null;
+// 2026-11-11: measured off Nixon's MODE-menu photo, a dot cell is 5.56% of
+// the glass width; at 3.2 ours was 5.35% and the row ended short of the glass.
+const PITCH_X = 3.33, PITCH_Y = 32 / 7;
+const DOT_X = 3.0, DOT_Y = 4.3;
+let lastDots = null, lastSegs = null, blinkOn = true, blinkTimer = null;
 
 // The cursor blinks at roughly 1 s, lit about 0.6 s of it (measured off the
 // 18:26 recording at 10 fps). The canvas owns the blink now, so the phase
@@ -3961,10 +4785,14 @@ function drawDots(win, cur, W) {
   if (!cv || typeof cv.getContext !== 'function') return;   // test DOM shim
   lastDots = { win, cur, W };
   startBlink();
+  paintDots(cv, canvasScale(), win, cur, W);
+  const big = mirrorCanvas('l1c');                         // the cursor blinks there too
+  if (big) paintDots(big, canvasScale() * BIG_K, win, cur, W);
+}
 
+function paintDots(cv, dpr, win, cur, W) {
   const cellW = (DOT_W + 1) * PITCH_X;      // five dots plus the gap to the next
   const cssW = W * cellW, cssH = DOT_H * PITCH_Y;
-  const dpr = window.devicePixelRatio || 1;
   if (cv.width !== Math.round(cssW * dpr)) {
     cv.width = Math.round(cssW * dpr);
     cv.height = Math.round(cssH * dpr);
@@ -3993,7 +4821,13 @@ function drawDots(win, cur, W) {
     // which was a guess carried over from other CASIO models. It is not that.
     const onCursor = i === cur && blinkOn;
     const under = onCursor && !S.ins;
-    if (onCursor) {
+    // 10 or fewer steps left of the 99: the cursor turns into a solid block
+    // (Nixon, 2026-11-11 — "the cursor went from | to full black rectangle")
+    const block = onCursor && !S.pedit && S.showing === 'input' && S.toks.length >= INPUT_MAX - 10;
+    if (block) {
+      g.fillStyle = INK;
+      for (let r = 0; r < DOT_H; r++) for (let c = 0; c < DOT_W; c++) g.fillRect(x0 + c * PITCH_X, r * PITCH_Y, DOT_X, DOT_Y);
+    } else if (onCursor) {
       g.fillStyle = INK;
       // The bottom bar is the cell's last ROW of dots, so it shows the same
       // horizontal gaps as any other glyph. The insert bar is a vertical run,
@@ -4037,9 +4871,13 @@ function drawDots(win, cur, W) {
 function drawSegs(rt, isMenu, tag) {
   const cv = document.getElementById('l2c');
   if (!cv || typeof cv.getContext !== 'function') return;   // test DOM shim
+  lastSegs = { rt, isMenu, tag };
+  paintSegs(cv, canvasScale(), rt, isMenu, tag);
+}
+
+function paintSegs(cv, dpr, rt, isMenu, tag) {
   const row = cv.parentNode;
   const cssW = (row.clientWidth || 332) - 9, cssH = L2_H;
-  const dpr = window.devicePixelRatio || 1;
   if (cv.width !== Math.round(cssW * dpr)) {
     cv.width = Math.round(cssW * dpr);
     cv.height = Math.round(cssH * dpr);
@@ -4051,7 +4889,10 @@ function drawSegs(rt, isMenu, tag) {
   g.setTransform(dpr, 0, 0, dpr, 0, 0);
   g.clearRect(0, 0, cssW, cssH);
   g.save();
-  g.transform(1, 0, -0.07, 1, cssH * 0.07, 0);   // the gentle LCD slant
+  g.transform(1, 0, -SEG_SLANT, 1, cssH * SEG_SLANT, 0);   // the LCD slant (REAL: ~8°)
+  // The slant pushes the TOP of the band right, so the exponent, which hangs
+  // from the top of the right column, ends this far in from the edge.
+  const expRight = cssW - SEG_SLANT * (cssH - SEG_TOP) - 1;
 
   // The whole field, faint: a sign cell, ten digit cells each with its own
   // point, the ×10 marking, a signed two-digit exponent, and the little column
@@ -4061,14 +4902,23 @@ function drawSegs(rt, isMenu, tag) {
   const gew = SEG_W * 0.45, geh = SEG_H * 0.42, get_ = SEG_T * 0.55;
   g.fillStyle = GHOST;
   drawSegText(g, '-8.8.8.8.8.8.8.8.8.8.', gright, SEG_TOP, SEG_W, SEG_H, SEG_T);
-  drawSegText(g, '-88', cssW, SEG_TOP, gew, geh, get_);
+  drawSegText(g, '-88', expRight, SEG_TOP, gew, geh, get_);
   g.font = '700 11px Arial';
   g.fillText('×10', gright + 1, SEG_TOP + SEG_H - 3);
-  drawTagCell(g, null, SEG_LEFT, SEG_TOP + 1);                       // the block
-  drawTagCell(g, dotRows('?'), SEG_LEFT + (DOT_W + 1) * TAG_P, SEG_TOP + 1);
-  drawTagCell(g, dotRows('='), SEG_LEFT, SEG_TOP + 1 + DOT_H * TAG_P);
+  // The tag column is dot-matrix and upright: draw its ghosts without the
+  // digits' slant, or they land beside the lit marks instead of under them.
+  g.save(); g.setTransform(dpr, 0, 0, dpr, 0, 0);
+  { const b = tagSpot('A', 0); drawTagCell(g, null, b.x, b.y, b.p); }   // the block
+  for (const ch of ['?', '=']) { const q = tagSpot(ch, 1); drawTagCell(g, dotRows(ch), q.x, q.y, q.p); }
+  g.restore();
   g.fillStyle = INK;
 
+  if (isMenu && MENU_LAYOUT) {
+    const first = gright - 10 * SEG_W;
+    for (const d of MENU_LAYOUT.digits) drawSegChar(g, d.ch, first + d.slot * SEG_W, SEG_TOP, SEG_W, SEG_H, SEG_T);
+    g.restore();
+    return;
+  }
   if (isMenu) {
     // Select the nearest real digit slot under each label. The upper dot grid
     // has a different pitch; using its x coordinate directly misses the LCD.
@@ -4094,7 +4944,9 @@ function drawSegs(rt, isMenu, tag) {
     // sign + two digits, small, right-aligned at the very edge — "-88" has to
     // fit the column too, which is what the all-segments photo shows lit
     const ew = SEG_W * 0.45, eh = SEG_H * 0.42, et = SEG_T * 0.55;
-    drawSegText(g, m[2], cssW, SEG_TOP, ew, eh, et);       // exponent, right-aligned
+    // always two digits: ENG on 123 shows ×10⁰⁰ (Nixon, 2026-11-11)
+    const ex = m[2].replace(/^(-?)(\d)$/, '$10$2');
+    drawSegText(g, ex, expRight, SEG_TOP, ew, eh, et);   // exponent, right-aligned
     g.font = '700 11px Arial';
     g.fillText('×10', right + 1, SEG_TOP + SEG_H - 3);
   }
@@ -4109,23 +4961,82 @@ function drawSegs(rt, isMenu, tag) {
   // putting up with). The cell is smaller than a digit, about a third as tall.
   if (tag) {
     g.fillStyle = INK;
-    const cell = (DOT_W + 1) * TAG_P;
     [...tag].forEach((ch, n) => {
       const rows = dotRows(ch);
       if (!rows) return;
-      // '=' drops to the next row, under the cell, instead of running alongside
-      drawTagCell(g, rows,
-        SEG_LEFT + (ch === '=' ? 0 : n * cell),
-        SEG_TOP + 1 + (ch === '=' ? DOT_H * TAG_P : 0));
+      const q = tagSpot(ch, n);
+      drawTagCell(g, rows, q.x, q.y, q.p);
     });
   }
+}
+
+// ------------------------------------------------------------ menu layout
+// A menu's numbers are seven-segment digits, so they can only stand in the
+// digit slots — and the labels above are placed to sit over them, not the
+// other way round. REAL (Nixon's photos, 2026-11-10): MODE shows COMP / CMPLX /
+// BASE over 1 / 2 / 3, the Prog menu ? → : ◢ over 1 2 3 4, each number right
+// under the first letter of its label, labels starting one cell in from the
+// left, and the page arrows in their own columns. We used to place the labels
+// first and snap each number to the nearest slot, which drifted.
+let MENU_LAYOUT = null;
+// Where each label starts, by how many there are — measured off the photos:
+// COMP / CMPLX / BASE begin at cells 0, 5 and 11; four labels at 0, 4, 8, 12.
+const MENU_STARTS = { 1: [0], 2: [0, 7], 3: [0, 5, 11], 4: [0, 4, 8, 12] };
+function menuLayout(m) {
+  if (!m || m.segRight || typeof m.l1 !== 'string' || typeof m.l2 !== 'string') return null;
+  const words = m.l1.replace(/[▸◂]/g, ' ').trim().split(/\s+/).filter(Boolean);
+  const digits = [...m.l2].filter(c => /\d/.test(c));
+  const starts = MENU_STARTS[digits.length];
+  if (!starts || words.length !== digits.length || words.some(w => w.length > 1 && w.includes(':'))) return null;   // 'MODE:COMP' is a heading, not labels
+  // Same sums as paintSegs(): where digit slot 0 sits, from the left of the
+  // glass canvas, with the slant applied at mid-digit height.
+  const row = document.getElementById('l2c') && document.getElementById('l2c').parentNode;
+  const cssW = ((row && row.clientWidth) || 332) - 9;
+  const first = cssW - SEG_GUTTER - 10 * SEG_W;
+  const bw = Math.min(SEG_W - SEG_T * 1.55, SEG_H * 0.42);
+  const slant = SEG_SLANT * (L2_H - (SEG_TOP + SEG_H / 2));
+  const cellW = (DOT_W + 1) * PITCH_X, half = (DOT_W * PITCH_X) / 2;
+  const out = Array.from({ length: 16 }, () => ({ t: ' ', g: ' ' }));
+  const placed = [];
+  let next = 0;
+  for (let i = 0; i < words.length; i++) {
+    const wc = toCells(words[i]);
+    // A one-cell label (? → : ◢) stands where a longer label's second cell
+    // would: cells 1, 5, 9, 13 on the real Prog menu.
+    const c = Math.max(next, starts[i] + (wc.length === 1 ? 1 : 0));
+    if (c + wc.length > 16) return null;
+    wc.forEach((cell, j) => { out[c + j] = cell; });
+    next = c + wc.length + 1;
+    // The number sits under the label's second cell (its only cell if it has one).
+    // Measured on the real glass (Nixon's MODE and Prog menu photos,
+    // 2026-11-10), as fractions of its width: dot cell j is centred at
+    // 0.0911 + 0.05556 j, digit slot k at 0.1197 + 0.0791 k. The number goes
+    // in the slot nearest the label's second cell: 3 labels → slots 0 4 8,
+    // 4 labels → 0 3 6 9, as both photos show.
+    const cellX = 0.0911 + 0.05556 * (starts[i] + 1);
+    placed.push({ ch: digits[i], slot: Math.max(0, Math.min(9, Math.round((cellX - 0.1197) / 0.0791))) });
+  }
+  return { cells: out, digits: placed };
+}
+
+/** Where one character of the left-column tag goes, and at what dot pitch.
+ *  REAL (2026-11-10, fx50-test-Prog1.mov at "A? -5."): the variable letter is
+ *  a 5x7 cell a little under a third of the digit height, its top a touch
+ *  below the digits' top; the `?` is a separate, much SMALLER mark — about
+ *  half the letter's size — raised at its top right, like a superscript.
+ *  Ours used to draw the ? as a second full-size cell. `=` drops to the row
+ *  under the letter (all-segments photo, 2026-09-16). */
+function tagSpot(ch, n) {
+  const cell = (DOT_W + 1) * TAG_P;
+  if (ch === '?') return { x: SEG_LEFT + cell + TAG_P * 0.2, y: SEG_TOP - 1, p: TAG_P * 0.55 };
+  if (ch === '=') return { x: SEG_LEFT, y: SEG_TOP + 3 + DOT_H * TAG_P, p: TAG_P };
+  return { x: SEG_LEFT + n * cell, y: SEG_TOP + 2, p: TAG_P };
 }
 
 /** One cell of the little left-hand column, in the dot font at tag size.
  *  `rows = null` lights the whole cell — that is the solid block the machine
  *  shows beside the `?`. */
-function drawTagCell(g, rows, x0, y0) {
-  const p = TAG_P;
+function drawTagCell(g, rows, x0, y0, p = TAG_P) {
   for (let r = 0; r < DOT_H; r++) {
     for (let c = 0; c < DOT_W; c++) {
       if (!rows || (rows[r] & (1 << (DOT_W - 1 - c))))
@@ -4194,9 +5105,10 @@ function drawSyms(on) {
 }
 
 function render() {
+  if (S.pedit) syncPedit();
   const lcd = document.getElementById('lcd');
   if (lcd) lcd.classList.toggle('off', S.off === 'dark');
-  if (S.off) { renderOff(); announceDisplay(); return; }
+  if (S.off) { renderOff(); announceDisplay(); return syncMirror(); }
   drawSyms(f => f());
 
   const l1o = line1();
@@ -4221,20 +5133,26 @@ function render() {
     const a = txt(0, i), c = win[i] ? win[i].t : ' ', b = txt(i + 1, win.length);
     l1.innerHTML = `${esc(a)}<span class="cur">${esc(c)}</span>${esc(b)}`;
   }
-  drawDots(win, ccur < 0 ? -1 : ccur - start, W);
+  MENU_LAYOUT = S.menu ? menuLayout(S.menu) : null;
+  drawDots(MENU_LAYOUT ? MENU_LAYOUT.cells : win, ccur < 0 ? -1 : ccur - start, W);
   // ◀ / ▶ say the text runs off that side. They sit in their own columns, so
-  // they never cost a character cell.
-  document.getElementById('mkl').classList.toggle('on', start > 0);
+  // they never cost a character cell. A menu with more pages lights both:
+  // its pages go round in both directions (REAL, Nixon's photos 2026-11-10 of
+  // the MODE menu and the Prog command menu — arrows, not ▸ inside the text).
+  const paged = !!(S.menu && (S.menu.pages || S.menu.P) && (S.menu.pages || S.menu.P).length > 1);
+  document.getElementById('mkl').classList.toggle('on', start > 0 || paged);
   document.getElementById('mkr').classList
-    .toggle('on', cells.length - start > W || (ccur >= 0 && ccur - start >= W));
+    .toggle('on', cells.length - start > W || (ccur >= 0 && ccur - start >= W) || paged);
   // The FMLA chooser lights both, because ▲▼ walk the formula list there
   // (REAL: Nixon's photo of 01:QuadEquation has both lit).
   document.getElementById('mku').classList
-    .toggle('on', !!S.fmla || (S.hist.length > 0 && S.hidx < S.hist.length - 1));
+    // after the very first calculation ▲ is lit too (book photos, Function-02/05/07)
+    .toggle('on', !!S.fmla || (S.hist.length > 0 && (S.hidx < S.hist.length - 1
+      || (S.hist.length === 1 && S.showing === 'result'))));
   document.getElementById('mkd').classList.toggle('on', !!S.fmla || S.hidx > 0);
 
   const rt = resultText();
-  const shown = S.menu ? rt : withPoint(rt);     // the glass always shows the point
+  const shown = (S.menu || S.pedit) ? rt : withPoint(rt);     // the glass always shows the point (not a byte count)
   const l2 = document.getElementById('l2');
   // The "×10" is its own small marking on the glass with the exponent raised
   // above it (REAL: "9.87654322 ×10¹⁷" in the 20:25 recording). It used to be
@@ -4264,11 +5182,11 @@ function render() {
     l2.className = 'l2';
     l2.innerHTML = left + right + cxMark + angMark;
   }
-  drawSegs(shown, !!S.menu, tag);
+  drawSegs(shown, !!S.menu && !S.menu.segRight, tag);
   // Disp is a reverse-video badge fixed in the bottom-right corner of the
   // glass, not a symbol in the top row (REAL, 2026-08-09 recording).
   document.getElementById('dsp').classList
-    .toggle('on', !!(S.run && S.run.mode === 'disp'));
+    .toggle('on', !!(S.run && S.run.mode === 'disp' && !S.menu));
   announceDisplay(text, shown);
   l2.dataset.raw = rt;          // plain text of the same thing, for tests/debugging
 
@@ -4276,6 +5194,36 @@ function render() {
     b.classList.toggle('armed',
       (b.dataset.id === 'SHIFT' && S.shift) || (b.dataset.id === 'ALPHA' && S.alpha));
   });
+  syncMirror();
+}
+
+// ------------------------------------------------------------ the big glass
+// A projected board needs the SCREEN bigger than the machine around it: the
+// back row reads the answer, the key log tells them how to get it. This is a
+// copy of the real glass — the same markup, and the two canvases painted by
+// the same code at a larger scale — so it can never show something the
+// machine's own glass does not. (CalcX's big screen is a font that does not
+// look like the machine; this one is the machine.)
+let BIG_K = 0;
+function mirrorCanvas(id) {
+  if (!(BIG_K > 0)) return null;
+  const big = document.getElementById('big');
+  const cv = big && big.querySelector && big.querySelector(`[data-mid="${id}"]`);
+  return cv && typeof cv.getContext === 'function' ? cv : null;
+}
+function syncMirror() {
+  const big = document.getElementById('big');
+  const lcd = document.getElementById('lcd');
+  if (!big || !lcd || !(BIG_K > 0) || !big.querySelector) return;
+  big.innerHTML = `<div class="${lcd.className}">${lcd.innerHTML.replace(/ id="/g, ' data-mid="')}</div>`;
+  const glass = big.firstElementChild;
+  glass.style.width = `${lcd.offsetWidth}px`;
+  glass.style.transform = `scale(${BIG_K})`;
+  big.style.height = `${lcd.offsetHeight * BIG_K}px`;
+  if (S.off === 'dark') return;
+  const c1 = mirrorCanvas('l1c'), c2 = mirrorCanvas('l2c');
+  if (c1 && lastDots) paintDots(c1, canvasScale() * BIG_K, lastDots.win, lastDots.cur, lastDots.W);
+  if (c2 && lastSegs) paintSegs(c2, canvasScale() * BIG_K, lastSegs.rt, lastSegs.isMenu, lastSegs.tag);
 }
 function announceDisplay(top, bottom) {
   const output = document.getElementById('lcd-accessible'); if (!output) return;
@@ -4289,10 +5237,14 @@ function numText(v) {
 }
 
 // ------------------------------------------------------------------- input
+// The input line holds 99 steps (Nixon, 2026-11-11: 99 ones, then the keys
+// stop answering). Programs have their own 680-byte budget instead.
+const INPUT_MAX = 99;
 function ins(tok) {
   S.rerun = null;
   if (S.showing === 'result') { newInput(false); }
   S.note = '';
+  if (!S.pedit && S.toks.length >= INPUT_MAX && (S.ins || S.cur >= S.toks.length)) return;
   if (!S.ins && S.cur < S.toks.length) S.toks[S.cur] = tok;
   else S.toks.splice(S.cur, 0, tok);
   S.cur++;
@@ -4309,10 +5261,10 @@ function newInput(keepAns) {
   // must die with it. Leaving endTag behind put the formula's `x=` beside every
   // later answer — Nixon saw `x=7.` for 5+2 after one run of FMLA 01, and only
   // reloading the page cleared it (2026-09-22).
-  S.endStmt = ''; S.endTag = '';
+  S.endStmt = ''; S.endTag = ''; S.blankL2 = false;
   S.toks = keepAns ? [{ d: 'Ans', e: 'Ans' }] : [];
   S.cur = S.toks.length; S.result = null; S.error = null; S.showing = 'input';
-  S.engExp = 0; S.asFrac = null; S.asDms = false;
+  S.engExp = null; S.asFrac = null; S.asDms = false;
 }
 // character offset inside the engine string -> index into the token list
 function tokenIndexAt(pos) {
@@ -4328,10 +5280,20 @@ function tokenIndexAt(pos) {
 const OPS_AFTER_RESULT = new Set(['ADD', 'SUB', 'MUL', 'DIV', 'POW', 'INV', 'SQ', 'CUBE', 'MPLUS']);
 
 function exe() {
-  S.endStmt = ''; S.endTag = '';
+  S.endStmt = ''; S.endTag = ''; S.blankL2 = false;
   const src = S.toks.map(t => t.e).join('');
   if (!src) return;
   try {
+    // SHIFT 9 1 types ClrMemory; EXE on it alone clears the memories. Anything
+    // typed after it makes the line a Syntax ERROR (Nixon, 2026-11-11).
+    if (src === 'ClrMemory') {
+      // Nixon, 2026-11-11: the machine answers "Data Clear!" with the lower line empty
+      for (const k in S.ctx.vars) S.ctx.vars[k] = ZERO;
+      S.result = null; S.error = null;
+      S.showing = 'result'; S.engExp = null; S.asFrac = null; S.asDms = false; S.note = '';
+      S.endStmt = 'Data Clear!'; S.blankL2 = true;
+      return;
+    }
     const r = calc(src, S.ctx);
     S.result = r; S.error = null;
     S.hist.unshift({ toks: S.toks.map(t => ({ ...t })), r });
@@ -4342,7 +5304,7 @@ function exe() {
     // the machine parks the cursor on the offending token, not at the start
     S.errPos = e.pos != null ? tokenIndexAt(e.pos) : S.toks.length;
   }
-  S.showing = 'result'; S.engExp = 0; S.asFrac = null; S.asDms = false; S.note = '';
+  S.showing = 'result'; S.engExp = null; S.asFrac = null; S.asDms = false; S.note = '';
   S.showIm = !!(S.result && S.result.imFirst);
 }
 
@@ -4350,10 +5312,11 @@ function exe() {
 function menuMode() {
   const pages = [['COMP CMPLX BASE▸', ' 1    2     3'], ['◂SD   REG   PRGM', ' 4    5     6']];
   return {
-    l1: pages[0][0], l2: pages[0][1], pages, page: 0,
+    l1: pages[0][0], l2: pages[0][1], pages, page: 0, modeMenu: true,
     hit(n) {
       const names = ['COMP', 'CMPLX', 'BASE', 'SD', 'REG', 'PRGM'];
       if (n < 1 || n > 6) return false;
+      if (S.run) endRun();    // choosing a mode stops a program waiting at ? or ◢
       hideEditor();
       const done = { COMP: 1, CMPLX: 1, SD: 1, REG:1, PRGM: 1 };
       S.mode = names[n - 1];
@@ -4361,7 +5324,7 @@ function menuMode() {
       S.ctx.stat = [];        // leaving SD wipes the data, same as ClrStat
       S.note = done[S.mode] ? '' : `${S.mode}: 未做`;
       newInput(false);
-      if (S.mode === 'PRGM') openEditor();
+      if (S.mode === 'PRGM') { if (IS_3650) openEditor(); else { S.menu = menuPrgm(); return 'menu'; } }
       if (S.mode === 'REG') { S.menu=menuRegType(); return 'menu'; }
       return true;
     },
@@ -4379,7 +5342,7 @@ function menuSetup() {
     ['ab/c   d/c     ▸', ' 1     2', n => (n <= 2 && (S.ctx.frac = n === 1 ? 'ab/c' : 'd/c', true))],
     ['a+bi   r∠θ     ▸', ' 1     2', n => (n <= 2 && (S.ctx.cplx = n === 1 ? 'a+bi' : 'r∠θ', true))],
     ['FreqOn  FreqOff▸', ' 1       2', n => { if(n<1||n>2) return false; S.ctx.freqOn=n===1; return true; }],
-    ['◂Contrast', ' 1', n => n === 1],
+    ['◂Contrast', ' 1', n => { if (n !== 1) return false; S.sub = { kind: 'contrast' }; return 'sub'; }],
   ];
   return { l1: P[0][0], l2: P[0][1], P, page: 0, hit(n) { return P[this.page][2](n); } };
 }
@@ -4392,10 +5355,15 @@ function menuClr() {
         S.note = 'ClrStat'; S.showing = 'result';
         return true;
       }
-      if (n === 1) { for (const k in S.ctx.vars) S.ctx.vars[k] = ZERO; return true; }
-      if (n === 2) { S.ctx.angle = 'deg'; S.ctx.disp = { disp: 'norm1' }; S.ctx.frac = 'd/c'; return true; }
+      if (n === 1) {                     // types ClrMemory; EXE does the clearing
+        if (S.showing === 'result') newInput(false);
+        ins({ d: 'ClrMemory', e: 'ClrMemory' });
+        return true;
+      }
+      // factory setting is a b/c (Nixon, 2026-11-11)
+      if (n === 2) { S.ctx.angle = 'deg'; S.ctx.disp = { disp: 'norm1' }; S.ctx.frac = 'ab/c'; return true; }
       if (n === 3) {                       // All: back to factory state
-        S.mode = 'COMP'; S.ctx = new Ctx({ mode: 'COMP', frac: 'd/c' });
+        S.mode = 'COMP'; S.ctx = new Ctx({ mode: 'COMP', frac: 'ab/c' });
         S.hist = []; S.hidx = -1; S.hyp = 0; S.run = null;
         // The real machine empties program memory here. Ours leaves the factory
         // with programs in it, so factory state means the shipped four are back.
@@ -4504,6 +5472,175 @@ function menuSvar() {
   };
 }
 
+// ------------------------------------------------- PRGM editing on the glass
+// Nixon's book (CASIO-All-8-Prog p.1, "Enter Programs Editing Mode") prints
+// every screen of it: MODE 6 → EDIT RUN DEL → 1 → "EDIT Program / P-1234 xxx"
+// (xxx = bytes left) → 1 → "MODE:COMP CMPLX" → 2 → the lower line reads 000
+// and you type the program; ON when you are done. The command keys come off
+// the book's appendix ("Program Command Entries"): Prog opens a nine-page
+// menu (Prog 1 = ?, Prog 2 = →, Prog 4 = ◢, Prog ▶ 1 = ⇒, Prog ◀ 1 = If …),
+// cross-checked page by page against CalcX. Details the book does not show —
+// the lower line is the program's SIZE, not the cursor's position; AC goes
+// back to EDIT RUN DEL — follow CalcX and are ⚠️ not yet checked on a machine.
+// Words that read as commands get a space after them on the glass.
+const PROG_WORDS = new Set(['If', 'Then', 'Else', 'IfEnd', 'While', 'WhileEnd', 'For', 'To', 'Step',
+  'Next', 'Break', 'Goto', 'Lbl', 'Fix', 'Sci', 'Norm', 'Deg', 'Rad', 'Gra', 'ClrMemory', 'ClrStat']);
+/** A statement drawn exactly as the edit screen draws it, so `Then 2` looks
+ *  the same while editing, at a ◢ and when the program ends. */
+function progLine(text) {
+  return byteTokens(text).filter(t => t !== '\n').map(t => progTok(t).d).join('').trimEnd();
+}
+function progTok(t) {
+  return { d: t === '\n' ? ':' : t === '⊖' ? '-' : PROG_WORDS.has(t) ? t + ' ' : t, e: t, raw: t };
+}
+const progFree = () => PROGRAM_BYTES - S.progs.reduce((n, p) => n + byteCount(p || ''), 0);
+
+function menuPrgm() {
+  return {
+    l1: 'EDIT  RUN   DEL', l2: '1     2     3', prgm: true,
+    hit(n) {
+      if (n < 1 || n > 3) return false;
+      S.menu = menuPick(['edit', 'run', 'del'][n - 1]); return 'menu';
+    },
+  };
+}
+function menuPick(kind) {
+  return {
+    l1: `${kind.toUpperCase()} Program`, prgm: true, segRight: true,
+    get l2() { return `P-1234 ${String(progFree()).padStart(3, ' ')}`; },
+    hit(n) {
+      if (n < 1 || n > 4) return false;
+      const slot = n - 1;
+      if (kind === 'run') { S.menu = null; S.psel = slot; startRun(slot); return true; }
+      if (kind === 'del') {
+        S.progs[slot] = ''; saveProgs(); syncEditor();
+        S.menu = menuPrgm(); return 'menu';
+      }
+      // A new program first asks which mode it runs in; an existing one keeps its own.
+      if ((S.progs[slot] || '').trim()) { startEdit(slot); return true; }
+      S.menu = menuPmode(slot); return 'menu';
+    },
+  };
+}
+function menuPmode(slot) {
+  // Nixon, 2026-11-11: COMP CMPLX = 1 2, ▶ shows BASE SD REG = 3 4 5. The two
+  // pages are one list — 3 on the first page still picks BASE.
+  const pages = [['MODE:COMP CMPLX', '     1    2'], ['BASE  SD   REG', ' 3    4     5']];
+  return {
+    l1: pages[0][0], l2: pages[0][1], pages, page: 0, prgm: true,
+    hit(n) {
+      if (n < 1 || n > 5) return false;
+      S.pmodes[slot] = PROG_MODES[n - 1]; saveProgs();
+      startEdit(slot); return true;
+    },
+  };
+}
+function menuPcmd() {
+  return {
+    l1: PCMD[0][0], l2: PCMD[0][1], pages: PCMD, page: 0,
+    hit(n) {
+      const t = PCMD[this.page][2][n - 1];
+      if (!t) return false;
+      S.menu = null; ins(progTok(t)); return true;
+    },
+  };
+}
+function menuSetupProg() {
+  const P = [['Deg  Rad  Gra  ▸', ' 1    2    3', SETUP_CMDS[0]],
+             ['Fix  Sci  Norm ▸', ' 1    2    3', SETUP_CMDS[1]]];
+  return {
+    l1: P[0][0], l2: P[0][1], pages: P, page: 0,
+    hit(n) { const t = P[this.page][2][n - 1]; if (!t) return false; S.menu = null; ins(progTok(t)); return true; },
+  };
+}
+function startEdit(slot) {
+  if (S.run) endRun();    // never edit under a program that is still waiting
+  S.menu = null; S.psel = slot; S.mode = 'PRGM'; S.ctx.mode = 'PRGM';
+  newInput(false);
+  S.toks = glassTokens(S.progs[slot] || '');
+  S.cur = 0; S.ins = true; S.note = '';
+  // `saved` is the text this glass last read or wrote. Opening a program must
+  // not rewrite it, and an edit made in the studio meanwhile must not be lost.
+  S.pedit = { slot, last: S.toks.slice(), saved: S.progs[slot] || '', base: null };
+  S.pedit.base = peditSource();
+}
+/** A program as glass tokens. A layout line break (free, not a key) is not a
+ *  cursor stop: it rides on the token before it so it survives a save. */
+function glassTokens(src) {
+  const out = [];
+  for (const t of byteTokens(src)) {
+    if (t === '\n') { if (out.length) out[out.length - 1] = { ...out[out.length - 1], nl: true }; continue; }
+    out.push(progTok(t));
+  }
+  return out;
+}
+const peditSource = () => {
+  const parts = [];
+  for (const t of S.toks) {
+    let v = t.raw ?? t.d;
+    // the (−) key right after a value stays the sign key, so it errors when run
+    if (t.e === '⊖' || v === '⊖') v = followsValue(joinTokens(parts)) ? '⊖' : '-';
+    parts.push(v); if (t.nl) parts.push('\n');
+  }
+  return joinTokens(parts);
+};
+/** Write the glass back into the program store. Over the 680-byte budget the
+ *  last key is undone — the machine refuses a key it has no room for. */
+function syncPedit() {
+  if (S.run) return;      // a running program's input line is not the program
+  const before = S.progs[S.pedit.slot] || '';
+  if (before !== S.pedit.saved) {
+    // changed elsewhere (the studio) while the glass was open: that text wins
+    S.toks = glassTokens(before); S.cur = Math.min(S.cur, S.toks.length);
+    S.pedit.saved = before; S.pedit.last = S.toks.slice(); S.pedit.base = peditSource();
+    return;
+  }
+  const src = peditSource();
+  if (src === S.pedit.base || src === before) return;   // nothing typed: leave the text alone
+  const others = S.progs.reduce((n, p, i) => n + (i === S.pedit.slot ? 0 : byteCount(p || '')), 0);
+  if (others + byteCount(src) > PROGRAM_BYTES) {
+    S.toks = S.pedit.last.slice(); S.cur = Math.min(S.cur, S.toks.length); return;
+  }
+  S.progs[S.pedit.slot] = src; S.pedit.last = S.toks.slice();
+  S.pedit.saved = src; S.pedit.base = src;
+  saveProgs(); syncEditor();
+}
+function leavePrgm() {
+  S.pedit = null; S.menu = null;
+  S.mode = 'COMP'; S.ctx.mode = 'COMP';
+  newInput(false);
+}
+/** Keys that mean something else inside the program editor. Everything not
+ *  handled here types a token into the program through the ordinary path. */
+function peditKey(id, sh, al) {
+  if (id === 'ON') { leavePrgm(); return true; }
+  if (id === 'AC') {
+    if (sh) { S.pedit = null; leavePrgm(); powerOff(); return true; }
+    S.pedit = null; newInput(false); S.menu = menuPrgm(); return true;
+  }
+  if (id === 'EXE') { ins(progTok(':')); return true; }
+  if (id === 'PROG' || (id === 'D3' && sh)) { S.menu = menuPcmd(); return true; }
+  if (id === 'UP') { S.cur = 0; return true; }
+  if (id === 'DOWN') { S.cur = S.toks.length; return true; }
+  if (id === 'MODE') { if (sh) S.menu = menuSetupProg(); return true; }
+  if (id === 'FMLA') return true;
+  if (id === 'D9' && sh) {
+    const t = ['SD', 'REG'].includes(S.pmodes[S.pedit.slot]) ? 'ClrStat' : 'ClrMemory';
+    S.menu = { l1: 'Mem  Setup  All', l2: ' 1     2     3', hit(n) { if (n !== 1) return false; S.menu = null; ins(progTok(t)); return true; } };
+    return true;
+  }
+  if (id === 'MPLUS') { ins(progTok(al ? 'M' : sh ? 'M−' : 'M+')); return true; }
+  if (id === 'RCL') { if (sh) ins(progTok('→')); return true; }
+  if (id === 'ENG') { if (al || S.pmodes[S.pedit.slot] === 'CMPLX') ins(progTok('i')); return true; }
+  if (id === 'ANS' && !sh) { ins(progTok('Ans')); return true; }
+  // CMPLX-only SHIFT labels (arg, Conjg, ∠) follow the program's own mode.
+  if (sh && S.pmodes[S.pedit.slot] === 'CMPLX' && (KEYMAP[id] || {}).shCx) { ins({ ...KEYMAP[id].shCx }); return true; }
+  if (sh && ['SD', 'REG'].includes(S.pmodes[S.pedit.slot]) && (id === 'D1' || id === 'D2')) {
+    S.menu = id === 'D1' ? menuSsum() : menuSvar(); return true;
+  }
+  return false;
+}
+
 function menuProg() {
   return {
     l1: 'P1  P2  P3  P4', l2: ' 1   2   3   4',
@@ -4533,15 +5670,36 @@ function menuConst(editing = false) {
   };
 }
 
+/** LCD contrast, -4 (light) … +4 (dark), like the machine's SETUP Contrast. */
+function applyContrast() {
+  const k = 1 - (S.contrast || 0) * 0.06;     // ▶ DARK → lower brightness
+  const els = typeof document.querySelectorAll === 'function' ? [...document.querySelectorAll('#lcd, #big .lcd')] : [document.getElementById('lcd')];
+  for (const el of els) if (el && el.style) el.style.filter = S.contrast ? `brightness(${k.toFixed(2)})` : '';
+}
 function handleMenu(id) {
   const m = S.menu;
-  if (id === 'AC' || (id === 'MODE' && !S.shift)) { S.menu = null; S.shift = false; return; }
+  // MODE walks the MODE menu: page 1 (COMP CMPLX BASE), page 2 (SD REG PRGM),
+  // then back to wherever the machine was — a paused program included
+  // (Nixon, 2026-11-11). On any other menu MODE just closes it.
+  if (id === 'MODE' && !S.shift && m.modeMenu && m.page === 0) {
+    m.page = 1; m.l1 = m.pages[1][0]; m.l2 = m.pages[1][1]; return;
+  }
+  if (id === 'AC' || (id === 'MODE' && !S.shift)) { S.menu = null; S.sub = null; S.shift = false; return; }
   // SHIFT still arms while a menu is showing, and SHIFT + a digit means the
   // user reached for a menu key again, not for an item: pressing SHIFT 2 a
   // second time on S-VAR closes it on the real machine (Kenneth, 2026-09-13).
   // Without this the digit was read as a selection, so "exit" picked σx.
   if (id === 'SHIFT') { S.shift = !S.shift; return; }
   if (S.shift && /^D\d$/.test(id)) { S.menu = null; S.sub = null; S.shift = false; return; }
+  if (S.sub && S.sub.kind === 'contrast') {
+    // ◀ lighter, ▶ darker; AC (above) leaves. Nixon, 2026-11-11: the machine
+    // has this screen. Its exact wording is not checked yet.
+    if (id === 'LEFT' || id === 'RIGHT') {
+      S.contrast = Math.max(-4, Math.min(4, (S.contrast || 0) + (id === 'RIGHT' ? 1 : -1)));
+      applyContrast(); try { localStorage.setItem('fx50-contrast', String(S.contrast)); } catch { /* private mode */ }
+    }
+    return;
+  }
   if (id === 'LEFT' || id === 'RIGHT') {
     const P = m.P || m.pages;
     if (P) {
@@ -4555,13 +5713,22 @@ function handleMenu(id) {
   const n = +d[1];
   if (S.sub) {                                  // Fix / Sci digit entry
     const k = S.sub.kind;
-    if (k === 'norm') { if (n === 1 || n === 2) S.ctx.disp = { disp: n === 1 ? 'norm1' : 'norm2' }; }
-    else S.ctx.disp = { disp: k, n };
+    if (k === 'norm') {
+      if (n !== 1 && n !== 2) return;          // Norm takes only 1 or 2; other keys do nothing
+      S.ctx.disp = { disp: n === 1 ? 'norm1' : 'norm2' };
+    } else S.ctx.disp = { disp: k, n };
     S.sub = null; S.menu = null; return;
   }
   const r = m.hit(n);
   if (r === 'menu') return;
-  if (r === 'sub') { m.l1 = '  0 ~ 9 ?'; m.l2 = ''; return; }
+  if (r === 'sub') {
+    // the prompt names the setting (Nixon, 2026-11-11); one screen, no ◀ ▶
+    // Nixon, 2026-11-11: the ◀ ▶ here are 5×7 dot characters in the text
+    // row, not the arrow segments beside it.
+    if (S.sub.kind === 'contrast') { m.l1 = '◀ LIGHT   DARK ▶'; m.l2 = 'CASIO'; m.segRight = true; m.P = null; m.pages = null; return; }
+    m.l1 = { fix: 'Fix 0~9?', sci: 'Sci 0~9?', norm: 'Norm 1~2?' }[S.sub.kind];
+    m.l2 = ''; m.pages = null; m.P = null; return;
+  }
   if (r) S.menu = null;
 }
 
@@ -4581,6 +5748,10 @@ function press(id) {
     if (id !== 'ON') return;
     S.off = null;
   }
+  if (S.menu && S.menu.prgm && (id === 'ON' || (id === 'MODE' && !S.shift))) {
+    if (id === 'ON') { leavePrgm(); return render(); }
+    S.menu = menuMode(); return render();
+  }
   if (S.menu) { handleMenu(id); return render(); }
   if (S.fmla) { handleFmla(id); return render(); }
 
@@ -4595,7 +5766,15 @@ function press(id) {
 
   // ---- while a program is running, only a few keys are live
   if (S.run) {
-    if (id === 'AC' || id === 'ON') { endRun(); closeEditor(); newInput(false); return render(); }
+    if (id === 'AC' || id === 'ON') {
+      const off = id === 'AC' && S.shift;
+      endRun(); closeEditor(); newInput(false); S.shift = false;
+      if (off) return powerOff();          // SHIFT AC is OFF, program or not
+      return render();
+    }
+    // MODE opens the MODE menu over a waiting program; MODE twice more comes
+    // back to it, a number switches mode and ends it (Nixon, 2026-11-11).
+    if (id === 'MODE' && !S.shift && (S.run.mode === 'disp' || S.run.mode === 'input')) { S.menu = menuMode(); return render(); }
     // SHIFT EXE is Re⇔Im, so at a ◢ it flips to the other half of a complex
     // value instead of stepping on (REAL, 2026-08-09 recording).
     if (id === 'EXE' && S.shift && S.run.mode === 'disp') {
@@ -4667,8 +5846,9 @@ function press(id) {
     S.pending = null;
   }
 
+  if (S.pedit && peditKey(id, sh, al)) return render();
   // In PRGM mode the keypad types into the program, exactly like the machine.
-  if (S.mode === 'PRGM' && !S.run && editorKey(id, sh, al)) return render();
+  if (IS_3650 && S.mode === 'PRGM' && !S.run && !S.pedit && editorKey(id, sh, al)) return render();
 
   const k = KEYMAP[id] || {};
 
@@ -4696,8 +5876,15 @@ function press(id) {
       exe(); return render();
     case 'LEFT': case 'RIGHT': {
       if (S.progErrAt != null) {           // jump into the program, at the bad character
-        focusEditorAt(S.progErrAt);
-        S.error = null; S.showing = 'input';
+        const at = S.progErrAt, slot = S.progErrSlot;
+        S.progErrAt = null; S.error = null; S.showing = 'input';
+        focusEditorAt(at);
+        if (slot != null && !IS_3650) {
+          // the machine opens the program with the cursor on the error
+          startEdit(slot);
+          const before = normalize(S.progs[slot] || '').slice(0, at);
+          S.cur = Math.max(0, Math.min(byteCount(before), S.toks.length));
+        }
         return render();
       }
       if (S.error) {                       // go to where the error is, like the machine
@@ -4728,13 +5915,24 @@ function press(id) {
       // In CMPLX mode this key is the imaginary unit (manual: "the ENG key acts
       // as the key for entering i"), and ENG conversion is not available there.
       if (al || S.mode === 'CMPLX') { ins({ d: 'i', e: 'i' }); return render(); }
-      if (S.result) S.engExp += sh ? -3 : 3;
+      // ENG first puts the answer in engineering form (exponent a multiple of
+      // 3, mantissa 1–999: 0.08125 → 81.25×10⁻³); after that each ENG moves
+      // the exponent up 3 and each SHIFT ENG (←) down 3.
+      if (S.result && S.result.value && S.result.value.m !== undefined) {
+        const v = S.result.value;
+        if (S.engExp === null) {
+          const order = v.isZero() ? 0 : (v.m < 0n ? -v.m : v.m).toString().length - 1 + v.q;
+          S.engExp = Math.floor(order / 3) * 3 - (sh ? 3 : 0);
+        } else S.engExp += sh ? -3 : 3;
+        S.asFrac = null; S.asDms = false;
+      }
       return render();
     }
     case 'HYP': if (al) { ins({ d: 'C', e: 'C' }); return render(); } S.hyp = sh ? 2 : 1; return render();
     case 'SIN': case 'COS': case 'TAN': {
       if (al && VAR_KEYS[id]) { ins({ d: VAR_KEYS[id], e: VAR_KEYS[id] }); return render(); }
-      if (S.hyp) { const t = HYP[id][S.hyp - 1]; S.hyp = 0; ins({ d: t, e: t }); return render(); }
+      // hyp SHIFT sin and SHIFT hyp sin both give sinh⁻¹( (Nixon, 2026-11-11)
+      if (S.hyp) { const t = HYP[id][S.hyp === 2 || sh ? 1 : 0]; S.hyp = 0; ins({ d: t, e: t }); return render(); }
       break;
     }
     case 'MPLUS': {
@@ -4765,7 +5963,7 @@ function press(id) {
       break;
     case 'DMS':
       if (al) { ins({ d: 'B', e: 'B' }); return render(); }
-      if (S.showing === 'result' && S.result) { S.asDms = !S.asDms; return render(); }
+      if (S.showing === 'result' && S.result) { S.asDms = S.asFrac !== null && S.result.type === 'dms' ? false : !S.asDms; S.asFrac = null; return render(); }
       break;
     case 'PROG': S.menu = menuProg(); return render();
     case 'FMLA':
@@ -4802,9 +6000,22 @@ try {
     else document.body.classList.remove('model-arriving');
   }
 } catch { /* optional visual transition */ }
+applySkin(initialSkin(), false);
 syncEditor();
+try { S.contrast = Math.max(-4, Math.min(4, +localStorage.getItem('fx50-contrast') || 0)); } catch { S.contrast = 0; }
 render();
+applyContrast();
+drawKlog();
 fitWidth();
+// Offline: a school's wifi drops, the lesson must not. The worker keeps the
+// last copy it saw and only answers from it when the network does not.
+try {
+  const loc = window.location || {};
+  if (navigator.serviceWorker && (loc.protocol === 'https:' || loc.hostname === 'localhost'))
+    // Relative, so it works at a site root (Netlify) and under a sub-path
+    // (GitHub Pages: /fx50-app/). Pages in dist/ sit one folder down.
+    navigator.serviceWorker.register(/\/dist\/[^/]*$/.test(loc.pathname || '') ? '../sw.js' : 'sw.js').catch(() => {});
+} catch { /* no worker: still works online */ }
 try {
   const pending = sessionStorage.getItem('fx50.pending-program');
   if (pending) {
@@ -4819,7 +6030,7 @@ if (typeof window.addEventListener === 'function') {
 // exposed so the test suite can drive the bundled build as well as the sources
 // The last five are test hooks: they let book-test.mjs run Nixon's published
 // programs against the packaged bundle, not just against the sources.
-window.fx = { S, press, startRun, openEditor, normalize, byteCount, editorKey, fmlaTitle, toCells, CSS,
+window.fx = { S, applySkin, SKIN_CSS, checkProgram, clearKlog, press, tap, startTeach, stopTeach, programKeys, tokenKeys, startRun, openEditor, normalize, byteCount, editorKey, fmlaTitle, toCells, CSS,
   compile, runProgram, calc, Ctx, fmtResult, toDms, dotRows, prepareProgramImport, applyProgramImport, stageProgramImport };
 
 </script>

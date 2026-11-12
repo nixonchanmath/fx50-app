@@ -9,7 +9,7 @@ import {cpSync,readdirSync,readFileSync,writeFileSync,rmSync,existsSync,statSync
 import {join} from 'node:path';
 const src=process.argv[2];
 if(!src||!existsSync(join(src,'index.html')))throw Error('Pass the built public/ folder of fx50-live');
-const keep=new Set(['.git','.nojekyll','README.md','tools','icons-src']);
+const keep=new Set(['.git','.gitignore','.nojekyll','README.md','tools','icons-src']);
 for(const n of readdirSync('.'))if(!keep.has(n))rmSync(n,{recursive:true,force:true});
 cpSync(src,'.',{recursive:true});
 cpSync('icons-src','icons',{recursive:true});
