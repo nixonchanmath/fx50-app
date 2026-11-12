@@ -20,3 +20,6 @@ git add -A && git commit -m "Release x.y.z" && git push
 ```
 
 `tools/sync-from-source.mjs` copies the build, makes `/icons` and manifest paths relative (Pages serves under `/fx50-app/`), and uses the icons in `icons-src/`.
+
+## Safety
+This repo is public. Do not commit student data, passwords or private notes here. See `.gitignore`.
